@@ -69,8 +69,6 @@ dependencies = [
 [[package]]
 name = "anthropic-sdk"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a53979b7fe35436c455d87fb1eb7dce96244e3d36e4ec9922de472cbbe5f66ab"
 dependencies = [
  "anyhow",
  "dotenv",
