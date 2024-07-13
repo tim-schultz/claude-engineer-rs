@@ -1,1 +1,2 @@
-list files in current directory
+What are the files in the current directory and its children
+

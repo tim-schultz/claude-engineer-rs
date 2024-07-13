@@ -1,3 +1,9 @@
+mod prompts;
+use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
+
+mod tools;
+use tools::TOOLS;
+
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::fs;
@@ -8,142 +14,78 @@ use anthropic_sdk::Client;
 
 pub struct Claude {
     client: Client,
+    system_prompt: String,
 }
 
 pub const MODEL: &str = "claude-3-5-sonnet-20240620";
+pub const CONTINUATION_EXIT_PHRASE: &str = "AUTOMODE_COMPLETE";
+pub const MAX_CONTINUATION_ITERATIONS: i8 = 25;
 
 impl Claude {
     pub fn new(model: &str) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")?;
         let client = Client::new().auth(&api_key).model(model);
-        Ok(Self { client })
+        // use update_system_prompt(current_iteration=None, max_iterations=None): to rust when auto mode is enabled
+        // until then this system prompt will work
+        let system_prompt = format!(
+            r#"
+            {}
+            {}"#,
+            BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT
+        );
+        Ok(Self {
+            client,
+            system_prompt,
+        })
     }
-    pub fn tools(&self) -> Result<Value> {
-        let tools = json!([
-            {
-                "name": "create_folder",
-                "description": "Create a new folder at the specified path. Use this when you need to create a new directory in the project structure.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path where the folder should be created"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "create_file",
-                "description": "Create a new file at the specified path with content. Use this when you need to create a new file in the project structure.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path where the file should be created"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "The content of the file"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }
-            },
-            {
-                "name": "search_file",
-                "description": "Search for a specific pattern in a file and return the line numbers where the pattern is found. Use this to locate specific code or text within a file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path of the file to search"
-                        },
-                        "search_pattern": {
-                            "type": "string",
-                            "description": "The pattern to search for in the file"
-                        }
-                    },
-                    "required": ["path", "search_pattern"]
-                }
-            },
-            {
-            "name": "edit_and_apply",
-            "description": "Apply changes to a file. Use this when you need to edit a file.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "The path of the file to edit"
-                    },
-                    "new_content": {
-                        "type": "string",
-                        "description": "The new content to apply to the file"
-                    }
-                },
-                "required": ["path", "new_content"]
-            }
-        },
-            {
-                "name": "read_file",
-                "description": "Read the contents of a file at the specified path. Use this when you need to examine the contents of an existing file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path of the file to read"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "list_files",
-                "description": "List all files and directories in the specified folder. Use this when you need to see the contents of a directory.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The path of the folder to list (default: current directory)"
-                        }
-                    }
-                }
-            },
-            {
-                "name": "tavily_search",
-                "description": "Perform a web search using Tavily API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        ]);
-        Ok(tools)
-    }
-    pub async fn initiate_query_with_tools(&self, prompt: &str) -> Result<String> {
-        let tools = self.tools()?;
 
+    // def update_system_prompt(current_iteration=None, max_iterations=None):
+    //     global base_system_prompt, automode_system_prompt
+    //     chain_of_thought_prompt = """
+    //     Answer the user's request using relevant tools (if they are available). Before calling a tool, do some analysis within <thinking></thinking> tags. First, think about which of the provided tools is the relevant tool to answer the user's request. Second, go through each of the required parameters of the relevant tool and determine if the user has directly provided or given enough information to infer a value. When deciding if the parameter can be inferred, carefully consider all the context to see if it supports a specific value. If all of the required parameters are present or can be reasonably inferred, close the thinking tag and proceed with the tool call. BUT, if one of the values for a required parameter is missing, DO NOT invoke the function (not even with fillers for the missing params) and instead, ask the user to provide the missing parameters. DO NOT ask for more information on optional parameters if it is not provided.
+
+    //     Do not reflect on the quality of the returned search results in your response.
+    //     """
+    //     if automode:
+    //         iteration_info = ""
+    //         if current_iteration is not None and max_iterations is not None:
+    //             iteration_info = f"You are currently on iteration {current_iteration} out of {max_iterations} in automode."
+    //         return base_system_prompt + "\n\n" + automode_system_prompt.format(iteration_info=iteration_info) + "\n\n" + chain_of_thought_prompt
+    //     else:
+    //         return base_system_prompt + "\n\n" + chain_of_thought_prompt
+    // pub async fn update_system_prompt(&self) -> Result<()> {
+    //     let message = &serde_json::json!([{"role": "system", "content": prompt}]);
+    //     dbg!(&message);
+
+    //     let request = self
+    //         .client
+    //         .clone()
+    //         .tools(&TOOLS)
+    //         .max_tokens(3000)
+    //         .messages(message)
+    //         .build()?;
+
+    //     let mut response = String::new();
+    //     request
+    //         .execute(|text| {
+    //             response.push_str(&text);
+    //             async move {}
+    //         })
+    //         .await?;
+
+    //     Ok(())
+    // }
+    pub async fn initiate_query_with_tools(&self, prompt: &str) -> Result<String> {
         let message = &serde_json::json!([{"role": "user", "content": prompt}]);
         dbg!(&message);
 
         let request = self
             .client
             .clone()
-            .tools(&tools)
+            .tools(&TOOLS)
             .max_tokens(3000)
             .messages(message)
+            .system(&self.system_prompt)
             .build()?;
 
         let mut response = String::new();
