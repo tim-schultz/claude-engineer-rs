@@ -2,19 +2,28 @@ mod prompts;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
 
 mod tools;
+use serde::{Deserialize, Serialize};
 use tools::TOOLS;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::process::Command;
 
-use anthropic_sdk::Client;
+use anthropic_sdk::{Client, ContentItem};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Message {
+    role: String,
+    content: String,
+}
 
 pub struct Claude {
     client: Client,
     system_prompt: String,
+    conversation_history: Vec<Message>,
+    current_conversation: Vec<Message>,
 }
 
 pub const MODEL: &str = "claude-3-5-sonnet-20240620";
@@ -36,6 +45,8 @@ impl Claude {
         Ok(Self {
             client,
             system_prompt,
+            conversation_history: vec![],
+            current_conversation: vec![],
         })
     }
 
@@ -75,28 +86,74 @@ impl Claude {
 
     //     Ok(())
     // }
-    pub async fn initiate_query_with_tools(&self, prompt: &str) -> Result<String> {
-        let message = &serde_json::json!([{"role": "user", "content": prompt}]);
-        dbg!(&message);
+    pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
+        self.current_conversation = vec![Message {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }];
+        dbg!(&self.current_conversation);
+
+        let mut combined_conversation = self.conversation_history.clone();
+        combined_conversation.extend(self.current_conversation.clone());
+        let messages =
+            serde_json::to_value(&combined_conversation).context("Failed to serialize messages")?;
+        dbg!(&messages);
 
         let request = self
             .client
             .clone()
             .tools(&TOOLS)
-            .max_tokens(3000)
-            .messages(message)
+            .max_tokens(4000)
+            .messages(&messages)
             .system(&self.system_prompt)
             .build()?;
 
-        let mut response = String::new();
-        request
-            .execute(|text| {
-                response.push_str(&text);
-                async move {}
-            })
-            .await?;
+        match request.execute_and_return_json().await {
+            Ok(anthropic_response) => {
+                dbg!(&anthropic_response);
+                println!(
+                    "Execution successful. Response ID: {}",
+                    anthropic_response.id
+                );
 
-        Ok(response)
+                let mut response_text = String::new();
+                for item in anthropic_response.content {
+                    match item {
+                        ContentItem::Text { text } => {
+                            println!("Assistant: {}", text);
+                            response_text.push_str(&text);
+                        }
+                        ContentItem::ToolUse { id, name, input } => {
+                            println!("Tool Use: {} ({}), Input: {:?}", name, id, input);
+                            // Here you might want to handle tool use, perhaps by calling the actual tool
+                            // and then feeding the result back into the conversation
+                        }
+                    }
+                }
+
+                // Update conversation history
+                self.conversation_history
+                    .extend(self.current_conversation.clone());
+                self.conversation_history.push(Message {
+                    role: "assistant".to_string(),
+                    content: response_text.clone(),
+                });
+
+                Ok(response_text)
+            }
+            Err(e) => {
+                if e.to_string()
+                    .contains("Too many Requests. You have been rate limited.")
+                {
+                    println!("Rate limited. Waiting for 5 seconds before retrying...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    // You might want to retry the request here
+                    // return self.initiate_query_with_tools(prompt).await;
+                }
+                println!("Execution failed: {:?}", e);
+                Err(e.context("Failed to execute query with tools"))
+            }
+        }
     }
 }
 
@@ -136,7 +193,7 @@ async fn main() -> Result<()> {
     println!("File contents:");
     println!("{}", contents);
 
-    let claude = Claude::new(MODEL)?;
+    let mut claude = Claude::new(MODEL)?;
 
     let response = claude.initiate_query_with_tools(&contents).await?;
 
