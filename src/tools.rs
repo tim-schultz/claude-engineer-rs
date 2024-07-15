@@ -98,19 +98,19 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
                 }
             }
         },
-        {
-            "name": "tavily_search",
-            "description": "Perform a web search using Tavily API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
+        // {
+        //     "name": "tavily_search",
+        //     "description": "Perform a web search using Tavily API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
+        //     "input_schema": {
+        //         "type": "object",
+        //         "properties": {
+        //             "query": {
+        //                 "type": "string",
+        //                 "description": "The search query"
+        //             }
+        //         },
+        //         "required": ["query"]
+        //     }
+        // }
     ])
 });

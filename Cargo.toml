@@ -18,3 +18,6 @@ dirs = "5.0.1"
 anyhow = "1.0.86"
 inquire = { version = "0.7.5", features = ["editor"] }
 once_cell = "1.19.0"
+syntect = "5.0"
+similar = "2.5.0"
+tavily = "1.0.0"

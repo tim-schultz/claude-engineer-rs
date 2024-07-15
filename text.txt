@@ -1,2 +1,2 @@
-What are the files in the current directory and its children
+list file in the src directory
 
