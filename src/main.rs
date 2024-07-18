@@ -2,11 +2,14 @@ mod prompts;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
 
 mod tools;
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tools::TOOLS;
 
+mod tool_executor;
+use tool_executor::ToolExecutor;
+
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::process::Command;
@@ -16,6 +19,31 @@ use anthropic_sdk::{Client, ContentItem};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     role: String,
+    content: MessageContent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    ToolUseAssistant(ToolUseAssistant),
+    ToolUseUser(ToolUseUser),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolUseAssistant {
+    #[serde(rename = "type")]
+    tool_type: String,
+    id: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolUseUser {
+    #[serde(rename = "type")]
+    tool_type: String,
+    tool_use_id: String,
     content: String,
 }
 
@@ -24,6 +52,14 @@ pub struct Claude {
     system_prompt: String,
     conversation_history: Vec<Message>,
     current_conversation: Vec<Message>,
+    tool_executor: ToolExecutor,
+}
+
+pub struct ToolUseResult {
+    id: String,
+    name: String,
+    input: Value,
+    tool_result: String,
 }
 
 pub const MODEL: &str = "claude-3-5-sonnet-20240620";
@@ -42,11 +78,13 @@ impl Claude {
             {}"#,
             BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT
         );
+        let tool_executor = ToolExecutor::new()?;
         Ok(Self {
             client,
             system_prompt,
             conversation_history: vec![],
             current_conversation: vec![],
+            tool_executor,
         })
     }
 
@@ -86,10 +124,37 @@ impl Claude {
 
     //     Ok(())
     // }
+    pub async fn process_content_response(
+        &mut self,
+        content: Vec<ContentItem>,
+    ) -> Result<(String, Vec<ToolUseResult>)> {
+        let mut response_text = String::new();
+        let mut tool_results: Vec<ToolUseResult> = vec![];
+        for item in content {
+            match item {
+                ContentItem::Text { text } => {
+                    println!("Assistant: {}", text);
+                    response_text.push_str(&text);
+                }
+                ContentItem::ToolUse { id, name, input } => {
+                    println!("Tool Use: {} ({}), Input: {:?}", name, id, input);
+                    let tool_result = self.tool_executor.execute_tool(&name, &input).await?;
+
+                    tool_results.push(ToolUseResult {
+                        id,
+                        name,
+                        input,
+                        tool_result,
+                    });
+                }
+            }
+        }
+        Ok((response_text, tool_results))
+    }
     pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
         self.current_conversation = vec![Message {
             role: "user".to_string(),
-            content: prompt.to_string(),
+            content: MessageContent::Text(prompt.to_string()),
         }];
         dbg!(&self.current_conversation);
 
@@ -97,7 +162,6 @@ impl Claude {
         combined_conversation.extend(self.current_conversation.clone());
         let messages =
             serde_json::to_value(&combined_conversation).context("Failed to serialize messages")?;
-        dbg!(&messages);
 
         let request = self
             .client
@@ -116,29 +180,54 @@ impl Claude {
                     anthropic_response.id
                 );
 
-                let mut response_text = String::new();
-                for item in anthropic_response.content {
-                    match item {
-                        ContentItem::Text { text } => {
-                            println!("Assistant: {}", text);
-                            response_text.push_str(&text);
-                        }
-                        ContentItem::ToolUse { id, name, input } => {
-                            println!("Tool Use: {} ({}), Input: {:?}", name, id, input);
-                            // Here you might want to handle tool use, perhaps by calling the actual tool
-                            // and then feeding the result back into the conversation
-                        }
-                    }
-                }
+                let (response_text, tool_usages) = self
+                    .process_content_response(anthropic_response.content)
+                    .await?;
 
                 // Update conversation history
                 self.conversation_history
                     .extend(self.current_conversation.clone());
                 self.conversation_history.push(Message {
                     role: "assistant".to_string(),
-                    content: response_text.clone(),
+                    content: MessageContent::Text(prompt.to_string()),
                 });
 
+                for tool_usage in tool_usages {
+                    self.conversation_history.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::ToolUseAssistant(ToolUseAssistant {
+                            tool_type: "tool_use".to_string(),
+                            id: tool_usage.id.clone(),
+                            name: tool_usage.name.clone(),
+                            input: tool_usage.input.clone(),
+                        }),
+                    });
+                    self.conversation_history.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::ToolUseUser(ToolUseUser {
+                            tool_type: "tool_use".to_string(),
+                            tool_use_id: tool_usage.id.clone(),
+                            content: tool_usage.tool_result,
+                        }),
+                    });
+                }
+
+                let mut combined_conversation_after_tool = self.conversation_history.clone();
+                combined_conversation_after_tool.extend(self.current_conversation.clone());
+                let messages_after_tool = serde_json::to_value(&combined_conversation)
+                    .context("Failed to serialize messages")?;
+
+                let request = self
+                    .client
+                    .clone()
+                    .tools(&TOOLS)
+                    .max_tokens(4000)
+                    .messages(&messages_after_tool)
+                    .system(&self.system_prompt)
+                    .build()?;
+
+                let tool_result = request.execute_and_return_json().await?;
+                dbg!(&tool_result);
                 Ok(response_text)
             }
             Err(e) => {

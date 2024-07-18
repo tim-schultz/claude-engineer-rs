@@ -1,1 +1,2 @@
-list files in current dir
+list file in the src directory
+
