@@ -1,4 +1,5 @@
 mod prompts;
+use async_recursion::async_recursion;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
 
 mod tools;
@@ -222,6 +223,24 @@ impl Claude {
         let res = request.execute_and_return_json().await?;
         Ok(res)
     }
+    #[async_recursion]
+    pub async fn recursive_ask_claude_tool(
+        &mut self,
+        tool_results: Vec<ToolUseResult>,
+    ) -> Result<()> {
+        // configure below
+        let max_iterations = 5;
+        let mut current_iteration = 0;
+        let tool_result = self.ask_claude_tool(tool_results).await?;
+        if tool_result.stop_reason == "tool_use" && current_iteration < max_iterations {
+            current_iteration += 1;
+            let (response_text, tool_usages) =
+                self.process_content_response(tool_result.content).await?;
+
+            let tool_result = self.recursive_ask_claude_tool(tool_usages).await?;
+        }
+        Ok(())
+    }
     pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
         match self.ask_claude_simple(prompt).await {
             Ok(anthropic_response) => {
@@ -230,6 +249,15 @@ impl Claude {
                     .await?;
 
                 let tool_result = self.ask_claude_tool(tool_usages).await?;
+
+                if tool_result.stop_reason == "tool_use" {
+                    let (response_text, tool_usages) =
+                        self.process_content_response(tool_result.content).await?;
+                    let tool_result = self.ask_claude_tool(tool_usages).await?;
+                    if tool_result.stop_reason == "tool_use" {
+                        return Ok(response_text);
+                    }
+                }
 
                 Ok(response_text)
             }
