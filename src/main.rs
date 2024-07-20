@@ -26,8 +26,8 @@ pub struct Message {
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
-    ToolUseAssistant(ToolUseAssistant),
-    ToolUseUser(ToolUseUser),
+    ToolUseAssistant(Vec<ToolUseAssistant>),
+    ToolUseUser(Vec<ToolUseUser>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -47,19 +47,20 @@ pub struct ToolUseUser {
     content: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolUseResult {
+    id: String,
+    name: String,
+    input: Value,
+    tool_result: String,
+}
+
 pub struct Claude {
     client: Client,
     system_prompt: String,
     conversation_history: Vec<Message>,
     current_conversation: Vec<Message>,
     tool_executor: ToolExecutor,
-}
-
-pub struct ToolUseResult {
-    id: String,
-    name: String,
-    input: Value,
-    tool_result: String,
 }
 
 pub const MODEL: &str = "claude-3-5-sonnet-20240620";
@@ -151,12 +152,14 @@ impl Claude {
         }
         Ok((response_text, tool_results))
     }
+    // pub async fn initiate_engineer(&mut self, prompt: &str) -> Result<AnthropicResponse> {
+
+    // }
     pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
         self.current_conversation = vec![Message {
             role: "user".to_string(),
             content: MessageContent::Text(prompt.to_string()),
         }];
-        dbg!(&self.current_conversation);
 
         let mut combined_conversation = self.conversation_history.clone();
         combined_conversation.extend(self.current_conversation.clone());
@@ -175,10 +178,6 @@ impl Claude {
         match request.execute_and_return_json().await {
             Ok(anthropic_response) => {
                 dbg!(&anthropic_response);
-                println!(
-                    "Execution successful. Response ID: {}",
-                    anthropic_response.id
-                );
 
                 let (response_text, tool_usages) = self
                     .process_content_response(anthropic_response.content)
@@ -187,34 +186,38 @@ impl Claude {
                 // Update conversation history
                 self.conversation_history
                     .extend(self.current_conversation.clone());
+
+                for tool_usage in tool_usages {
+                    dbg!(&tool_usage);
+                    self.conversation_history.push(Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::ToolUseAssistant(vec![ToolUseAssistant {
+                            tool_type: "tool_use".to_string(),
+                            id: tool_usage.id.clone(),
+                            name: tool_usage.name.clone(),
+                            input: tool_usage.input.clone(),
+                        }]),
+                    });
+
+                    self.conversation_history.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::ToolUseUser(vec![ToolUseUser {
+                            tool_type: "tool_result".to_string(),
+                            tool_use_id: tool_usage.id.clone(),
+                            content: tool_usage.tool_result,
+                        }]),
+                    });
+                }
+
                 self.conversation_history.push(Message {
                     role: "assistant".to_string(),
                     content: MessageContent::Text(prompt.to_string()),
                 });
 
-                for tool_usage in tool_usages {
-                    self.conversation_history.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::ToolUseAssistant(ToolUseAssistant {
-                            tool_type: "tool_use".to_string(),
-                            id: tool_usage.id.clone(),
-                            name: tool_usage.name.clone(),
-                            input: tool_usage.input.clone(),
-                        }),
-                    });
-                    self.conversation_history.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::ToolUseUser(ToolUseUser {
-                            tool_type: "tool_use".to_string(),
-                            tool_use_id: tool_usage.id.clone(),
-                            content: tool_usage.tool_result,
-                        }),
-                    });
-                }
-
                 let mut combined_conversation_after_tool = self.conversation_history.clone();
                 combined_conversation_after_tool.extend(self.current_conversation.clone());
-                let messages_after_tool = serde_json::to_value(&combined_conversation)
+                dbg!(combined_conversation_after_tool.len());
+                let messages_after_tool = serde_json::to_value(&combined_conversation_after_tool)
                     .context("Failed to serialize messages")?;
 
                 let request = self
@@ -226,8 +229,8 @@ impl Claude {
                     .system(&self.system_prompt)
                     .build()?;
 
-                let tool_result = request.execute_and_return_json().await?;
-                dbg!(&tool_result);
+                let tool_result_after = request.execute_and_return_json().await?;
+                dbg!(&tool_result_after);
                 Ok(response_text)
             }
             Err(e) => {
@@ -278,15 +281,9 @@ async fn main() -> Result<()> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
-    // Print the contents to the console
-    println!("File contents:");
-    println!("{}", contents);
-
     let mut claude = Claude::new(MODEL)?;
 
-    let response = claude.initiate_query_with_tools(&contents).await?;
-
-    println!("Response: {}", response);
+    claude.initiate_query_with_tools(&contents).await?;
 
     Ok(())
 }
