@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Read;
 use std::process::Command;
 
-use anthropic_sdk::{Client, ContentItem};
+use anthropic_sdk::{AnthropicResponse, Client, ContentItem};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -155,7 +155,7 @@ impl Claude {
     // pub async fn initiate_engineer(&mut self, prompt: &str) -> Result<AnthropicResponse> {
 
     // }
-    pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
+    pub async fn ask_claude_simple(&mut self, prompt: &str) -> Result<AnthropicResponse> {
         self.current_conversation = vec![Message {
             role: "user".to_string(),
             content: MessageContent::Text(prompt.to_string()),
@@ -175,62 +175,62 @@ impl Claude {
             .system(&self.system_prompt)
             .build()?;
 
-        match request.execute_and_return_json().await {
-            Ok(anthropic_response) => {
-                dbg!(&anthropic_response);
+        let res = request.execute_and_return_json().await?;
+        Ok(res)
+    }
+    pub async fn ask_claude_tool(
+        &mut self,
+        tool_results: Vec<ToolUseResult>,
+    ) -> Result<AnthropicResponse> {
+        for tool_usage in tool_results {
+            dbg!(&tool_usage);
+            self.current_conversation.push(Message {
+                role: "assistant".to_string(),
+                content: MessageContent::ToolUseAssistant(vec![ToolUseAssistant {
+                    tool_type: "tool_use".to_string(),
+                    id: tool_usage.id.clone(),
+                    name: tool_usage.name.clone(),
+                    input: tool_usage.input.clone(),
+                }]),
+            });
 
+            self.current_conversation.push(Message {
+                role: "user".to_string(),
+                content: MessageContent::ToolUseUser(vec![ToolUseUser {
+                    tool_type: "tool_result".to_string(),
+                    tool_use_id: tool_usage.id.clone(),
+                    content: tool_usage.tool_result,
+                }]),
+            });
+        }
+
+        let mut combined_conversation_after_tool = self.conversation_history.clone();
+        combined_conversation_after_tool.extend(self.current_conversation.clone());
+        dbg!(combined_conversation_after_tool.len());
+        let messages_after_tool = serde_json::to_value(&combined_conversation_after_tool)
+            .context("Failed to serialize messages")?;
+
+        let request = self
+            .client
+            .clone()
+            .tools(&TOOLS)
+            .max_tokens(4000)
+            .messages(&messages_after_tool)
+            .system(&self.system_prompt)
+            .build()?;
+
+        let res = request.execute_and_return_json().await?;
+        Ok(res)
+    }
+    pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
+        match self.ask_claude_simple(prompt).await {
+            Ok(anthropic_response) => {
                 let (response_text, tool_usages) = self
                     .process_content_response(anthropic_response.content)
                     .await?;
 
-                // Update conversation history
-                self.conversation_history
-                    .extend(self.current_conversation.clone());
+                let tool_result = self.ask_claude_tool(tool_usages).await?;
 
-                for tool_usage in tool_usages {
-                    dbg!(&tool_usage);
-                    self.conversation_history.push(Message {
-                        role: "assistant".to_string(),
-                        content: MessageContent::ToolUseAssistant(vec![ToolUseAssistant {
-                            tool_type: "tool_use".to_string(),
-                            id: tool_usage.id.clone(),
-                            name: tool_usage.name.clone(),
-                            input: tool_usage.input.clone(),
-                        }]),
-                    });
-
-                    self.conversation_history.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::ToolUseUser(vec![ToolUseUser {
-                            tool_type: "tool_result".to_string(),
-                            tool_use_id: tool_usage.id.clone(),
-                            content: tool_usage.tool_result,
-                        }]),
-                    });
-                }
-
-                self.conversation_history.push(Message {
-                    role: "assistant".to_string(),
-                    content: MessageContent::Text(prompt.to_string()),
-                });
-
-                let mut combined_conversation_after_tool = self.conversation_history.clone();
-                combined_conversation_after_tool.extend(self.current_conversation.clone());
-                dbg!(combined_conversation_after_tool.len());
-                let messages_after_tool = serde_json::to_value(&combined_conversation_after_tool)
-                    .context("Failed to serialize messages")?;
-
-                let request = self
-                    .client
-                    .clone()
-                    .tools(&TOOLS)
-                    .max_tokens(4000)
-                    .messages(&messages_after_tool)
-                    .system(&self.system_prompt)
-                    .build()?;
-
-                let tool_result_after = request.execute_and_return_json().await?;
-                dbg!(&tool_result_after);
                 Ok(response_text)
             }
             Err(e) => {
