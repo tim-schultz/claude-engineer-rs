@@ -72,7 +72,7 @@ impl ToolExecutor {
         let ps = SyntaxSet::load_defaults_newlines();
         let ts = ThemeSet::load_defaults();
         let syntax = ps.find_syntax_by_extension("diff").unwrap();
-        let mut h = HighlightLines::new(syntax, &ts.themes["base16-monokai.dark"]);
+        let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
 
         let mut highlighted = String::new();
         for line in LinesWithEndings::from(diff_text) {
@@ -95,8 +95,6 @@ impl ToolExecutor {
             return Ok("No changes detected.".to_string());
         }
 
-        fs::write(path, new_content)?;
-
         let mut diff_text = String::new();
         for change in diff.iter_all_changes() {
             let sign = match change.tag() {
@@ -110,19 +108,29 @@ impl ToolExecutor {
         let highlighted_diff = self.highlight_diff(&diff_text);
         println!("Changes in {}:\n{}", path, highlighted_diff);
 
-        let added_lines = diff
-            .iter_all_changes()
-            .filter(|c| c.tag() == ChangeTag::Insert)
-            .count();
-        let removed_lines = diff
-            .iter_all_changes()
-            .filter(|c| c.tag() == ChangeTag::Delete)
-            .count();
+        println!("Do you want to apply these changes? (y/n)");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
 
-        Ok(format!(
-            "Changes applied to {}:\n  Lines added: {}\n  Lines removed: {}",
-            path, added_lines, removed_lines
-        ))
+        if input.trim().to_lowercase() == "y" {
+            fs::write(path, new_content)?;
+
+            let added_lines = diff
+                .iter_all_changes()
+                .filter(|c| c.tag() == ChangeTag::Insert)
+                .count();
+            let removed_lines = diff
+                .iter_all_changes()
+                .filter(|c| c.tag() == ChangeTag::Delete)
+                .count();
+
+            Ok(format!(
+                "Changes applied to {}:\n  Lines added: {}\n  Lines removed: {}",
+                path, added_lines, removed_lines
+            ))
+        } else {
+            Ok("Changes were not applied.".to_string())
+        }
     }
 
     fn edit_and_apply(&self, path: &str, new_content: &str) -> Result<String> {
@@ -151,4 +159,75 @@ impl ToolExecutor {
     //     let response = self.tavily.answer(query).await?;
     //     Ok(serde_json::to_string_pretty(&response)?)
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_create_folder() {
+        let executor = ToolExecutor::new().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let folder_path = temp_dir.path().join("test_folder");
+
+        let result = executor
+            .create_folder(folder_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            result,
+            format!("Folder created: {}", folder_path.to_str().unwrap())
+        );
+        assert!(folder_path.exists());
+    }
+
+    #[test]
+    fn test_create_file() {
+        let executor = ToolExecutor::new().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_file.txt");
+        let content = "Hello, world!";
+
+        let result = executor
+            .create_file(file_path.to_str().unwrap(), content)
+            .unwrap();
+        assert_eq!(
+            result,
+            format!("File created: {}", file_path.to_str().unwrap())
+        );
+        assert!(file_path.exists());
+        assert_eq!(fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_read_file() {
+        let executor = ToolExecutor::new().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_read.txt");
+        let content = "Test content";
+        fs::write(&file_path, content).unwrap();
+
+        let result = executor.read_file(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_list_files() {
+        let executor = ToolExecutor::new().unwrap();
+        let temp_dir = tempdir().unwrap();
+        fs::write(temp_dir.path().join("file1.txt"), "").unwrap();
+        fs::write(temp_dir.path().join("file2.txt"), "").unwrap();
+
+        let result = executor
+            .list_files(temp_dir.path().to_str().unwrap())
+            .unwrap();
+        let files: Vec<&str> = result.split('\n').collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"file1.txt"));
+        assert!(files.contains(&"file2.txt"));
+    }
+
+    // Note: We can't easily test edit_and_apply in a unit test due to its interactive nature
+    // A more comprehensive integration test or mocking the user input would be needed for that
 }

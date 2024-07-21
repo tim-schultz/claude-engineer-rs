@@ -1,1 +1,1 @@
-make src/main.rs more readable
+update tool_executor.rs so that it has unit tests for the various tools that are used in the program. The tests should have mock inputs that test the output of the tools
