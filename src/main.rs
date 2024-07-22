@@ -2,12 +2,9 @@ mod prompts;
 use async_recursion::async_recursion;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
 
-mod tools;
 use serde_json::Value;
-use tools::TOOLS;
-
-mod tool_executor;
-use tool_executor::ToolExecutor;
+mod tools;
+use tools::{ToolExecutor, TOOLS};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
