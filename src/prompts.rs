@@ -43,6 +43,10 @@ Code Editing Best Practices:
 5. Review changes thoroughly after each modification.
 
 Always strive for accuracy, clarity, and efficiency in your responses and actions. If uncertain, use the tavily_search tool or admit your limitations.
+
+Continuation:
+- When all goals are completed, respond with "AUTOMODE_COMPLETE" to exit automode.
+- Do not ask for additional tasks or modifications once goals are achieved.
 "#;
 
 pub const CHAIN_OF_THOUGHT_PROMPT: &str = r#"

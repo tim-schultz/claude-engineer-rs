@@ -1,3 +1,4 @@
+mod github_tools;
 mod prompts;
 use async_recursion::async_recursion;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
@@ -69,8 +70,6 @@ impl Claude {
     pub fn new(model: &str) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")?;
         let client = Client::new().auth(&api_key).model(model);
-        // use update_system_prompt(current_iteration=None, max_iterations=None): to rust when auto mode is enabled
-        // until then this system prompt will work
         let system_prompt = format!(
             r#"
             {}
@@ -87,42 +86,6 @@ impl Claude {
         })
     }
 
-    // def update_system_prompt(current_iteration=None, max_iterations=None):
-    //     global base_system_prompt, automode_system_prompt
-    //     chain_of_thought_prompt = """
-    //     Answer the user's request using relevant tools (if they are available). Before calling a tool, do some analysis within <thinking></thinking> tags. First, think about which of the provided tools is the relevant tool to answer the user's request. Second, go through each of the required parameters of the relevant tool and determine if the user has directly provided or given enough information to infer a value. When deciding if the parameter can be inferred, carefully consider all the context to see if it supports a specific value. If all of the required parameters are present or can be reasonably inferred, close the thinking tag and proceed with the tool call. BUT, if one of the values for a required parameter is missing, DO NOT invoke the function (not even with fillers for the missing params) and instead, ask the user to provide the missing parameters. DO NOT ask for more information on optional parameters if it is not provided.
-
-    //     Do not reflect on the quality of the returned search results in your response.
-    //     """
-    //     if automode:
-    //         iteration_info = ""
-    //         if current_iteration is not None and max_iterations is not None:
-    //             iteration_info = f"You are currently on iteration {current_iteration} out of {max_iterations} in automode."
-    //         return base_system_prompt + "\n\n" + automode_system_prompt.format(iteration_info=iteration_info) + "\n\n" + chain_of_thought_prompt
-    //     else:
-    //         return base_system_prompt + "\n\n" + chain_of_thought_prompt
-    // pub async fn update_system_prompt(&self) -> Result<()> {
-    //     let message = &serde_json::json!([{"role": "system", "content": prompt}]);
-    //     dbg!(&message);
-
-    //     let request = self
-    //         .client
-    //         .clone()
-    //         .tools(&TOOLS)
-    //         .max_tokens(3000)
-    //         .messages(message)
-    //         .build()?;
-
-    //     let mut response = String::new();
-    //     request
-    //         .execute(|text| {
-    //             response.push_str(&text);
-    //             async move {}
-    //         })
-    //         .await?;
-
-    //     Ok(())
-    // }
     pub async fn process_content_response(
         &mut self,
         content: Vec<ContentItem>,
@@ -150,9 +113,7 @@ impl Claude {
         }
         Ok((response_text, tool_results))
     }
-    // pub async fn initiate_engineer(&mut self, prompt: &str) -> Result<AnthropicResponse> {
 
-    // }
     pub async fn ask_claude_simple(&mut self, prompt: &str) -> Result<AnthropicResponse> {
         self.current_conversation = vec![Message {
             role: "user".to_string(),
@@ -176,6 +137,7 @@ impl Claude {
         let res = request.execute_and_return_json().await?;
         Ok(res)
     }
+
     pub async fn ask_claude_tool(
         &mut self,
         tool_results: Vec<ToolUseResult>,
@@ -220,12 +182,12 @@ impl Claude {
         let res = request.execute_and_return_json().await?;
         Ok(res)
     }
+
     #[async_recursion]
     pub async fn recursive_ask_claude_tool(
         &mut self,
         tool_results: Vec<ToolUseResult>,
     ) -> Result<()> {
-        // configure below
         let max_iterations = 5;
         let mut current_iteration = 0;
         let tool_result = self.ask_claude_tool(tool_results).await?;
@@ -238,8 +200,10 @@ impl Claude {
         }
         Ok(())
     }
-    pub async fn initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
-        match self.ask_claude_simple(prompt).await {
+
+    #[async_recursion]
+    pub async fn recursive_initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
+        let res = match self.ask_claude_simple(prompt).await {
             Ok(anthropic_response) => {
                 let (response_text, tool_usages) = self
                     .process_content_response(anthropic_response.content)
@@ -264,51 +228,60 @@ impl Claude {
                 {
                     println!("Rate limited. Waiting for 5 seconds before retrying...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    // You might want to retry the request here
-                    // return self.initiate_query_with_tools(prompt).await;
                 }
                 println!("Execution failed: {:?}", e);
                 Err(e.context("Failed to execute query with tools"))
             }
+        };
+
+        let response = res?;
+        if response.contains(CONTINUATION_EXIT_PHRASE) {
+            return Ok(response);
+        } else {
+            self.load_text_editor()?;
+            Ok(self.recursive_initiate_query_with_tools(&response).await?)
         }
+    }
+    pub fn load_text_editor(&mut self) -> Result<String> {
+        let file_path = "text.txt";
+        fs::write(file_path, "")?;
+
+        let formatted_path = format!("./{}", file_path);
+        println!("Attempting to open file: {}", formatted_path);
+
+        let editors = ["vim"];
+
+        for editor in editors.iter() {
+            match Command::new(editor).arg(&formatted_path).status() {
+                Ok(status) => {
+                    println!("{} editor exited with status: {}", editor, status);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Failed to open {} editor: {}", editor, e);
+                    if editor == editors.last().unwrap() {
+                        println!("No suitable editor found. Skipping edit step.");
+                    }
+                }
+            }
+        }
+
+        let mut file = fs::File::open(file_path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(contents)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a new text file
-    let file_path = "text.txt";
-    fs::write(file_path, "")?;
-
-    // Attempt to open the file with an editor
-    let formatted_path = format!("./{}", file_path);
-    println!("Attempting to open file: {}", formatted_path);
-
-    let editors = ["vim"];
-
-    for editor in editors.iter() {
-        match Command::new(editor).arg(&formatted_path).status() {
-            Ok(status) => {
-                println!("{} editor exited with status: {}", editor, status);
-                break; // Exit the loop if an editor succeeds
-            }
-            Err(e) => {
-                eprintln!("Failed to open {} editor: {}", editor, e);
-                if editor == editors.last().unwrap() {
-                    println!("No suitable editor found. Skipping edit step.");
-                }
-            }
-        }
-    }
-
-    // Read the contents of the file after it's closed
-    let mut file = fs::File::open(file_path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-
     let mut claude = Claude::new(MODEL)?;
 
-    claude.initiate_query_with_tools(&contents).await?;
+    let contents = claude.load_text_editor()?;
+
+    claude
+        .recursive_initiate_query_with_tools(&contents)
+        .await?;
 
     Ok(())
 }

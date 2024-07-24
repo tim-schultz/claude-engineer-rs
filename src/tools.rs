@@ -8,6 +8,8 @@ use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+use crate::github_tools;
+
 use once_cell::sync::Lazy;
 
 pub static TOOLS: Lazy<Value> = Lazy::new(|| {
