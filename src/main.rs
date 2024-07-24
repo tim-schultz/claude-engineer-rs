@@ -7,13 +7,14 @@ use serde_json::Value;
 mod tools;
 use tools::{ToolExecutor, TOOLS};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::process::Command;
 
 use anthropic_sdk::{AnthropicResponse, Client, ContentItem};
+use log::{error, info, warn};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -68,7 +69,8 @@ pub const MAX_CONTINUATION_ITERATIONS: i8 = 25;
 
 impl Claude {
     pub fn new(model: &str) -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .context("Failed to get ANTHROPIC_API_KEY from environment")?;
         let client = Client::new().auth(&api_key).model(model);
         let system_prompt = format!(
             r#"
@@ -76,7 +78,7 @@ impl Claude {
             {}"#,
             BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT
         );
-        let tool_executor = ToolExecutor::new()?;
+        let tool_executor = ToolExecutor::new().context("Failed to create ToolExecutor")?;
         Ok(Self {
             client,
             system_prompt,
@@ -95,12 +97,16 @@ impl Claude {
         for item in content {
             match item {
                 ContentItem::Text { text } => {
-                    println!("Assistant: {}", text);
+                    info!("Assistant: {}", text);
                     response_text.push_str(&text);
                 }
                 ContentItem::ToolUse { id, name, input } => {
-                    println!("Tool Use: {} ({}), Input: {:?}", name, id, input);
-                    let tool_result = self.tool_executor.execute_tool(&name, &input).await?;
+                    info!("Tool Use: {} ({}), Input: {:?}", name, id, input);
+                    let tool_result = self
+                        .tool_executor
+                        .execute_tool(&name, &input)
+                        .await
+                        .with_context(|| format!("Failed to execute tool: {}", name))?;
 
                     tool_results.push(ToolUseResult {
                         id,
@@ -132,9 +138,13 @@ impl Claude {
             .max_tokens(4000)
             .messages(&messages)
             .system(&self.system_prompt)
-            .build()?;
+            .build()
+            .context("Failed to build Anthropic request")?;
 
-        let res = request.execute_and_return_json().await?;
+        let res = request
+            .execute_and_return_json()
+            .await
+            .context("Failed to execute Anthropic request")?;
         Ok(res)
     }
 
@@ -143,7 +153,6 @@ impl Claude {
         tool_results: Vec<ToolUseResult>,
     ) -> Result<AnthropicResponse> {
         for tool_usage in tool_results {
-            dbg!(&tool_usage);
             self.current_conversation.push(Message {
                 role: "assistant".to_string(),
                 content: MessageContent::ToolUseAssistant(vec![ToolUseAssistant {
@@ -166,9 +175,12 @@ impl Claude {
 
         let mut combined_conversation_after_tool = self.conversation_history.clone();
         combined_conversation_after_tool.extend(self.current_conversation.clone());
-        dbg!(combined_conversation_after_tool.len());
+        info!(
+            "Combined conversation length: {}",
+            combined_conversation_after_tool.len()
+        );
         let messages_after_tool = serde_json::to_value(&combined_conversation_after_tool)
-            .context("Failed to serialize messages")?;
+            .context("Failed to serialize messages after tool use")?;
 
         let request = self
             .client
@@ -177,9 +189,13 @@ impl Claude {
             .max_tokens(4000)
             .messages(&messages_after_tool)
             .system(&self.system_prompt)
-            .build()?;
+            .build()
+            .context("Failed to build Anthropic request after tool use")?;
 
-        let res = request.execute_and_return_json().await?;
+        let res = request
+            .execute_and_return_json()
+            .await
+            .context("Failed to execute Anthropic request after tool use")?;
         Ok(res)
     }
 
@@ -196,7 +212,9 @@ impl Claude {
             let (response_text, tool_usages) =
                 self.process_content_response(tool_result.content).await?;
 
-            let tool_result = self.recursive_ask_claude_tool(tool_usages).await?;
+            self.recursive_ask_claude_tool(tool_usages).await?;
+        } else if current_iteration >= max_iterations {
+            warn!("Reached maximum iterations in recursive_ask_claude_tool");
         }
         Ok(())
     }
@@ -226,62 +244,70 @@ impl Claude {
                 if e.to_string()
                     .contains("Too many Requests. You have been rate limited.")
                 {
-                    println!("Rate limited. Waiting for 5 seconds before retrying...");
+                    warn!("Rate limited. Waiting for 5 seconds before retrying...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    return self.recursive_initiate_query_with_tools(prompt).await;
                 }
-                println!("Execution failed: {:?}", e);
+                error!("Execution failed: {:?}", e);
                 Err(e.context("Failed to execute query with tools"))
             }
         };
 
         let response = res?;
         if response.contains(CONTINUATION_EXIT_PHRASE) {
-            return Ok(response);
+            Ok(response)
         } else {
             self.load_text_editor()?;
-            Ok(self.recursive_initiate_query_with_tools(&response).await?)
+            self.recursive_initiate_query_with_tools(&response).await
         }
     }
+
     pub fn load_text_editor(&mut self) -> Result<String> {
         let file_path = "text.txt";
-        fs::write(file_path, "")?;
+        fs::write(file_path, "").context("Failed to write to text.txt")?;
 
         let formatted_path = format!("./{}", file_path);
-        println!("Attempting to open file: {}", formatted_path);
+        info!("Attempting to open file: {}", formatted_path);
 
         let editors = ["vim"];
 
         for editor in editors.iter() {
             match Command::new(editor).arg(&formatted_path).status() {
                 Ok(status) => {
-                    println!("{} editor exited with status: {}", editor, status);
+                    info!("{} editor exited with status: {}", editor, status);
                     break;
                 }
                 Err(e) => {
-                    eprintln!("Failed to open {} editor: {}", editor, e);
+                    warn!("Failed to open {} editor: {}", editor, e);
                     if editor == editors.last().unwrap() {
-                        println!("No suitable editor found. Skipping edit step.");
+                        warn!("No suitable editor found. Skipping edit step.");
                     }
                 }
             }
         }
 
-        let mut file = fs::File::open(file_path)?;
+        let mut file = fs::File::open(file_path).context("Failed to open text.txt")?;
         let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
+        file.read_to_string(&mut contents)
+            .context("Failed to read contents of text.txt")?;
         Ok(contents)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut claude = Claude::new(MODEL)?;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let contents = claude.load_text_editor()?;
+    let mut claude = Claude::new(MODEL).context("Failed to initialize Claude")?;
+
+    let contents = claude
+        .load_text_editor()
+        .context("Failed to load text editor")?;
 
     claude
         .recursive_initiate_query_with_tools(&contents)
-        .await?;
+        .await
+        .context("Failed to initiate query with tools")?;
 
     Ok(())
 }
