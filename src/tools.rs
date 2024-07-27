@@ -65,23 +65,23 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
             }
         },
         {
-        "name": "edit_and_apply",
-        "description": "Apply changes to a file. Use this when you need to edit a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The path of the file to edit"
+            "name": "edit_and_apply",
+            "description": "Apply changes to a file. Use this when you need to edit a file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the file to edit"
+                    },
+                    "new_content": {
+                        "type": "string",
+                        "description": "The new content to apply to the file"
+                    }
                 },
-                "new_content": {
-                    "type": "string",
-                    "description": "The new content to apply to the file"
-                }
-            },
-            "required": ["path", "new_content"]
-        }
-    },
+                "required": ["path", "new_content"]
+            }
+        },
         {
             "name": "read_file",
             "description": "Read the contents of a file at the specified path. Use this when you need to examine the contents of an existing file.",
@@ -109,20 +109,28 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
                 }
             }
         },
-        // {
-        //     "name": "tavily_search",
-        //     "description": "Perform a web search using Tavily API to get up-to-date information or additional context. Use this when you need current information or feel a search could provide a better answer.",
-        //     "input_schema": {
-        //         "type": "object",
-        //         "properties": {
-        //             "query": {
-        //                 "type": "string",
-        //                 "description": "The search query"
-        //             }
-        //         },
-        //         "required": ["query"]
-        //     }
-        // }
+        {
+            "name": "fetch_commit_changes",
+            "description": "Fetch the the given commit's changes from a GitHub repository. Use this when you need to see the changes made in an external repository.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "owner": {
+                        "type": "string",
+                        "description": "The owner of the repository"
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "The name of the repository"
+                    },
+                    "sha": {
+                        "type": "string",
+                        "description": "The SHA of the commit to fetch"
+                    }
+                },
+                "required": ["owner", "repo", "sha"]
+            }
+        }
     ])
 });
 
@@ -163,14 +171,16 @@ impl ToolExecutor {
                     .and_then(|p| p.as_str())
                     .unwrap_or("."),
             ),
-            // "tavily_search" => {
-            //     self.tavily_search(
-            //         tool_input["query"]
-            //             .as_str()
-            //             .ok_or(anyhow!("Missing query"))?,
-            //     )
-            //     .await
-            // }
+            "fetch_commit_changes" => {
+                self.fetch_commit_changes(
+                    tool_input["owner"]
+                        .as_str()
+                        .ok_or(anyhow!("Missing owner"))?,
+                    tool_input["repo"].as_str().ok_or(anyhow!("Missing repo"))?,
+                    tool_input["sha"].as_str().ok_or(anyhow!("Missing sha"))?,
+                )
+                .await
+            }
             _ => Err(anyhow!("Unknown tool: {}", tool_name)),
         }
     }
@@ -272,10 +282,11 @@ impl ToolExecutor {
         Ok(files?.join("\n"))
     }
 
-    // async fn tavily_search(&self, query: &str) -> Result<String> {
-    //     let response = self.tavily.answer(query).await?;
-    //     Ok(serde_json::to_string_pretty(&response)?)
-    // }
+    async fn fetch_commit_changes(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
+        let commit = github_tools::fetch_latest_commits(owner, repo, sha).await?;
+        let changes = github_tools::process_commit_changes(commit)?;
+        Ok(changes)
+    }
 }
 
 #[cfg(test)]
