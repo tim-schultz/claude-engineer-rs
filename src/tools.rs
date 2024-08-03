@@ -110,6 +110,23 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
             }
         },
         {
+            "name": "read_multiple_files",
+            "description": "Read the contents of multiple files at the specified paths. This tool should be used when you need to examine the contents of multiple existing files at once. It will return the status of reading each file, and store the contents of successfully read files in the system prompt. If a file doesn't exist or can't be read, an appropriate error message will be returned for that file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "An array of absolute or relative paths of the files to read. Use forward slashes (/) for path separation, even on Windows systems."
+                    }
+                },
+                "required": ["paths"]
+            }
+        },
+        {
             "name": "fetch_commit_changes",
             "description": "Fetch the the given commit's changes from a GitHub repository. Use this when you need to see the changes made in an external repository.",
             "input_schema": {

@@ -1,1 +1,1 @@
- create a new tool in src/tools.rs that uses the octcrab crate to fetch a commit's changes and return it in plain text
+imrpove logging in src/tools.rs
