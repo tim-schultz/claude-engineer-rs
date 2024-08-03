@@ -10,6 +10,7 @@ use tools::{ToolExecutor, TOOLS};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::process::Command;
 
@@ -219,14 +220,54 @@ impl Claude {
         Ok(())
     }
 
-    #[async_recursion]
-    pub async fn recursive_initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
-        let res = match self.ask_claude_simple(prompt).await {
+    pub async fn chat_with_claude(&mut self, prompt: &str) -> Result<String> {
+        let response = match self.ask_claude_simple(prompt).await {
             Ok(anthropic_response) => {
+                info!("Anthropic response: {:?}", anthropic_response);
                 let (response_text, tool_usages) = self
                     .process_content_response(anthropic_response.content)
                     .await?;
 
+                info!("Tool usages: {:?}", tool_usages);
+                let tool_result = self.ask_claude_tool(tool_usages).await?;
+                info!("Tool result: {:?}", tool_result);
+
+                if tool_result.stop_reason == "tool_use" {
+                    let (response_text, tool_usages) =
+                        self.process_content_response(tool_result.content).await?;
+                    let tool_result = self.ask_claude_tool(tool_usages).await?;
+                    if tool_result.stop_reason == "tool_use" {
+                        return Ok(response_text);
+                    }
+                }
+
+                Ok(response_text)
+            }
+            Err(e) => {
+                if e.to_string()
+                    .contains("Too many Requests. You have been rate limited.")
+                {
+                    warn!("Rate limited. Waiting for 5 seconds before retrying...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    return self.recursive_initiate_query_with_tools(prompt).await;
+                }
+                error!("Execution failed: {:?}", e);
+                Err(e.context("Failed to execute query with tools"))
+            }
+        }?;
+        Ok(response)
+    }
+
+    #[async_recursion]
+    pub async fn recursive_initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
+        let response = match self.ask_claude_simple(prompt).await {
+            Ok(anthropic_response) => {
+                info!("Anthropic response: {:?}", anthropic_response);
+                let (response_text, tool_usages) = self
+                    .process_content_response(anthropic_response.content)
+                    .await?;
+
+                info!("Tool usages: {:?}", tool_usages);
                 let tool_result = self.ask_claude_tool(tool_usages).await?;
 
                 if tool_result.stop_reason == "tool_use" {
@@ -251,14 +292,25 @@ impl Claude {
                 error!("Execution failed: {:?}", e);
                 Err(e.context("Failed to execute query with tools"))
             }
-        };
+        }?;
 
-        let response = res?;
+        // let response = res?;
         if response.contains(CONTINUATION_EXIT_PHRASE) {
             Ok(response)
         } else {
-            self.load_text_editor()?;
-            self.recursive_initiate_query_with_tools(&response).await
+            info!("Response: {}", response);
+            println!("Do you want to proceed with current response? (y/n)");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            if input.trim().to_lowercase() == "y" {
+                self.recursive_initiate_query_with_tools(&response).await?;
+            } else {
+                let new_prompt = self.load_text_editor()?;
+                self.recursive_initiate_query_with_tools(&new_prompt)
+                    .await?;
+            }
+            Ok("Exiting...".to_string())
         }
     }
 
@@ -304,10 +356,16 @@ async fn main() -> Result<()> {
         .load_text_editor()
         .context("Failed to load text editor")?;
 
-    claude
-        .recursive_initiate_query_with_tools(&contents)
-        .await
-        .context("Failed to initiate query with tools")?;
+    loop {
+        let response = claude
+            .chat_with_claude(&contents)
+            .await
+            .context("Failed to initiate query with tools")?;
+        dbg!(&response);
+        if response.contains(CONTINUATION_EXIT_PHRASE) {
+            break;
+        }
+    }
 
     Ok(())
 }
