@@ -72,14 +72,21 @@ impl Claude {
     pub fn new(model: &str) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .context("Failed to get ANTHROPIC_API_KEY from environment")?;
-        let client = Client::new().auth(&api_key).model(model);
+        let client = Client::new()
+            .auth(&api_key)
+            .model(model)
+            .beta("max-tokens-3-5-sonnet-2024-07-15")
+            .max_tokens(8000)
+            .tools(&TOOLS);
         let system_prompt = format!(
             r#"
             {}
             {}"#,
             BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT
         );
-        let tool_executor = ToolExecutor::new().context("Failed to create ToolExecutor")?;
+        let tool_client = client.clone().system(&system_prompt.clone());
+        let tool_executor =
+            ToolExecutor::new(tool_client).context("Failed to create ToolExecutor")?;
         Ok(Self {
             client,
             system_prompt,
@@ -135,8 +142,6 @@ impl Claude {
         let request = self
             .client
             .clone()
-            .tools(&TOOLS)
-            .max_tokens(4000)
             .messages(&messages)
             .system(&self.system_prompt)
             .build()
@@ -186,8 +191,6 @@ impl Claude {
         let request = self
             .client
             .clone()
-            .tools(&TOOLS)
-            .max_tokens(4000)
             .messages(&messages_after_tool)
             .system(&self.system_prompt)
             .build()
@@ -361,7 +364,7 @@ async fn main() -> Result<()> {
             .chat_with_claude(&contents)
             .await
             .context("Failed to initiate query with tools")?;
-        dbg!(&response);
+        info!("Looped response: {}", &response);
         if response.contains(CONTINUATION_EXIT_PHRASE) {
             break;
         }
