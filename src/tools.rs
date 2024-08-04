@@ -1,8 +1,19 @@
+use anthropic_sdk::Client;
+use anthropic_sdk::ContentItem;
 use anyhow::{anyhow, Result};
+use async_recursion::async_recursion;
+use console::Term;
+use diff;
+use lazy_static::lazy_static;
+use log::info;
+use regex::Regex;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::sync::Mutex;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -11,6 +22,8 @@ use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 use crate::github_tools;
 
 use once_cell::sync::Lazy;
+
+pub static CODEEDITORMODEL: &str = "claude-3-5-sonnet-20240620";
 
 pub static TOOLS: Lazy<Value> = Lazy::new(|| {
     json!([
@@ -66,20 +79,24 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
         },
         {
             "name": "edit_and_apply",
-            "description": "Apply changes to a file. Use this when you need to edit a file.",
+            "description": "Apply AI-powered improvements to a file based on specific instructions and detailed project context. This function reads the file, processes it in batches using AI with conversation history and comprehensive code-related project context. It generates a diff and allows the user to confirm changes before applying them. The goal is to maintain consistency and prevent breaking connections between files. This tool should be used for complex code modifications that require understanding of the broader project context.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path of the file to edit"
+                        "description": "The absolute or relative path of the file to edit. Use forward slashes (/) for path separation, even on Windows systems."
                     },
-                    "new_content": {
+                    "instructions": {
                         "type": "string",
-                        "description": "The new content to apply to the file"
+                        "description": "After completing the code review, construct a plan for the change between <PLANNING> tags. Ask for additional source files or documentation that may be relevant. The plan should avoid duplication (DRY principle), and balance maintenance and flexibility. Present trade-offs and implementation choices at this step. Consider available Frameworks and Libraries and suggest their use when relevant. STOP at this step if we have not agreed a plan.\n\nOnce agreed, produce code between <OUTPUT> tags. Pay attention to Variable Names, Identifiers and String Literals, and check that they are reproduced accurately from the original source files unless otherwise directed. When naming by convention surround in double colons and in ::UPPERCASE::. Maintain existing code style, use language appropriate idioms. Produce Code Blocks with the language specified after the first backticks"
+                    },
+                    "project_context": {
+                        "type": "string",
+                        "description": "Comprehensive context about the project, including recent changes, new variables or functions, interconnections between files, coding standards, and any other relevant information that might affect the edit."
                     }
                 },
-                "required": ["path", "new_content"]
+                "required": ["path", "instructions", "project_context"]
             }
         },
         {
@@ -153,14 +170,24 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
 
 pub struct ToolExecutor {
     version: i8,
+    client: Client,
+    code_editor_tokens: HashMap<String, u32>,
+    code_editor_memory: Vec<String>,
+    code_editor_files: HashSet<String>,
 }
 
 impl ToolExecutor {
-    pub fn new() -> Result<Self> {
-        Ok(Self { version: 0 })
+    pub fn new(client: Client) -> Result<Self> {
+        Ok(Self {
+            version: 0,
+            client,
+            code_editor_tokens: HashMap::new(),
+            code_editor_memory: Vec::new(),
+            code_editor_files: HashSet::new(),
+        })
     }
 
-    pub async fn execute_tool(&self, tool_name: &str, tool_input: &Value) -> Result<String> {
+    pub async fn execute_tool(&mut self, tool_name: &str, tool_input: &Value) -> Result<String> {
         match tool_name {
             "create_folder" => {
                 self.create_folder(tool_input["path"].as_str().ok_or(anyhow!("Missing path"))?)
@@ -172,13 +199,19 @@ impl ToolExecutor {
                     .and_then(|c| c.as_str())
                     .unwrap_or(""),
             ),
-            "edit_and_apply" => self.edit_and_apply(
-                tool_input["path"].as_str().ok_or(anyhow!("Missing path"))?,
-                tool_input
-                    .get("new_content")
-                    .and_then(|c| c.as_str())
-                    .ok_or(anyhow!("Missing new_content"))?,
-            ),
+            "edit_and_apply" => {
+                self.edit_and_apply(
+                    tool_input["path"].as_str().ok_or(anyhow!("Missing path"))?,
+                    tool_input
+                        .get("new_content")
+                        .and_then(|c| c.as_str())
+                        .ok_or(anyhow!("Missing new_content"))?,
+                    tool_input["project_context"]
+                        .as_str()
+                        .ok_or(anyhow!("Missing project_context"))?,
+                )
+                .await
+            }
             "read_file" => {
                 self.read_file(tool_input["path"].as_str().ok_or(anyhow!("Missing path"))?)
             }
@@ -277,13 +310,308 @@ impl ToolExecutor {
         }
     }
 
-    fn edit_and_apply(&self, path: &str, new_content: &str) -> Result<String> {
-        let original_content = fs::read_to_string(path)?;
-        if new_content != original_content {
-            self.generate_and_apply_diff(&original_content, new_content, path)
-        } else {
-            Ok(format!("No changes needed for {}", path))
+    async fn parse_search_replace_blocks(&self, text: &str) -> Result<String> {
+        let re =
+            Regex::new(r"<SEARCH>\s*([\s\S]*?)\s*</SEARCH>\s*<REPLACE>\s*([\s\S]*?)\s*</REPLACE>")?;
+        let blocks: Vec<_> = re
+            .captures_iter(text)
+            .map(|cap| {
+                json!({
+                    "search": cap.get(1).unwrap().as_str().trim(),
+                    "replace": cap.get(2).unwrap().as_str().trim()
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&blocks)?)
+    }
+
+    pub async fn generate_edit_instructions(
+        &mut self,
+        file_path: &str,
+        file_content: &str,
+        instructions: &str,
+        project_context: &str,
+        full_file_contents: &HashMap<String, String>,
+    ) -> Result<String> {
+        let memory_context = self
+            .code_editor_memory
+            .iter()
+            .enumerate()
+            .map(|(i, mem)| format!("Memory {}:\n{:?}", i + 1, mem))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let full_file_contents_context = full_file_contents
+            .iter()
+            .filter(|&(path, _)| path != file_path || !self.code_editor_files.contains(path))
+            .map(|(path, content)| format!("--- {} ---\n{}", path, content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let system_prompt = format!(
+            r#"
+            You are an AI coding agent that generates edit instructions for code files. Your task is to analyze the provided code and generate SEARCH/REPLACE blocks for necessary changes. Follow these steps:
+    
+            1. Review the entire file content to understand the context:
+            {file_content}
+    
+            2. Carefully analyze the specific instructions:
+            {instructions}
+    
+            3. Take into account the overall project context:
+            {project_context}
+    
+            4. Consider the memory of previous edits:
+            {memory_context}
+    
+            5. Consider the full context of all files in the project:
+            {full_file_contents_context}
+    
+            6. Generate SEARCH/REPLACE blocks for each necessary change. Each block should:
+               - Include enough context to uniquely identify the code to be changed
+               - Provide the exact replacement code, maintaining correct indentation and formatting
+               - Focus on specific, targeted changes rather than large, sweeping modifications
+    
+            7. Ensure that your SEARCH/REPLACE blocks:
+               - Address all relevant aspects of the instructions
+               - Maintain or enhance code readability and efficiency
+               - Consider the overall structure and purpose of the code
+               - Follow best practices and coding standards for the language
+               - Maintain consistency with the project context and previous edits
+               - Take into account the full context of all files in the project
+    
+            IMPORTANT: RETURN ONLY THE SEARCH/REPLACE BLOCKS. NO EXPLANATIONS OR COMMENTS.
+            USE THE FOLLOWING FORMAT FOR EACH BLOCK:
+    
+            <SEARCH>
+            Code to be replaced
+            </SEARCH>
+            <REPLACE>
+            New code to insert
+            </REPLACE>
+    
+            If no changes are needed, return an empty list.
+            "#
+        );
+
+        let request = self
+            .client
+            .clone()
+            .system(&system_prompt)
+            .messages(&json!({"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}))
+            .build()?;
+
+        let response = request.execute_and_return_json().await?;
+
+        self.code_editor_tokens
+            .entry("input".to_string())
+            .and_modify(|e| *e += response.usage.input_tokens)
+            .or_insert(response.usage.input_tokens);
+        self.code_editor_tokens
+            .entry("output".to_string())
+            .and_modify(|e| *e += response.usage.output_tokens)
+            .or_insert(response.usage.output_tokens);
+        let text = match &response.content[0] {
+            ContentItem::Text { text } => text,
+            _ => return Err(anyhow!("Invalid response content")),
+        };
+
+        let edit_instructions = self.parse_search_replace_blocks(&text).await?;
+
+        self.code_editor_memory.push(format!(
+            "Edit Instructions for {}:\n{}",
+            file_path,
+            text.clone()
+        ));
+        self.code_editor_files.insert(file_path.to_string());
+
+        Ok(edit_instructions)
+    }
+
+    // async fn apply_edits(
+    //     &self,
+    //     path: &str,
+    //     edit_instructions: Vec<Value>,
+    //     original_content: &str,
+    // ) -> Result<(String, bool, String)> {
+    //     // Implement this function based on your requirements
+    //     // For now, it returns a placeholder
+    //     Ok((original_content.to_string(), false, String::new()))
+    // }
+
+    #[async_recursion]
+    pub async fn edit_and_apply(
+        &mut self,
+        path: &str,
+        instructions: &str,
+        project_context: &str,
+    ) -> Result<String> {
+        let is_automode = false;
+        let max_retries = 5;
+
+        let mut file_contents: HashMap<String, String> = HashMap::new();
+        let original_content = match file_contents.get(path) {
+            Some(content) => content.clone(),
+            None => {
+                let content = fs::read_to_string(path)?;
+                file_contents.insert(path.to_string(), content.clone());
+                content
+            }
+        };
+
+        for attempt in 0..max_retries {
+            let edit_instructions_json = self
+                .generate_edit_instructions(
+                    path,
+                    &original_content,
+                    instructions,
+                    project_context,
+                    &file_contents,
+                )
+                .await?;
+
+            let edit_instructions: Vec<Value> = serde_json::from_str(&edit_instructions_json)?;
+            println!(
+                "{}",
+                format!(
+                    "Attempt {}/{}: The following SEARCH/REPLACE blocks have been generated:",
+                    attempt + 1,
+                    max_retries
+                )
+            );
+
+            for (i, block) in edit_instructions.iter().enumerate() {
+                println!("Block {}:", i + 1);
+                println!(
+                    "{}",
+                    format!(
+                        "SEARCH:\n{}\n\nREPLACE:\n{}",
+                        block["search"].as_str().unwrap_or(""),
+                        block["replace"].as_str().unwrap_or("")
+                    )
+                );
+            }
+
+            let (edited_content, changes_made, failed_edits) = self
+                .apply_edits(path, edit_instructions, &original_content)
+                .await?;
+
+            if changes_made {
+                file_contents.insert(path.to_string(), edited_content.clone());
+                println!(
+                    "{}",
+                    format!("File contents updated in system prompt: {}", path)
+                );
+
+                if !failed_edits.is_empty() {
+                    println!("{}", "Some edits could not be applied. Retrying...");
+                    let new_instructions = format!(
+                        "{}\n\nPlease retry the following edits that could not be applied:\n{}",
+                        instructions, failed_edits
+                    );
+                    return self
+                        .edit_and_apply(path, &new_instructions, project_context)
+                        .await;
+                }
+
+                return Ok(format!("Changes applied to {}", path));
+            } else if attempt == max_retries - 1 {
+                return Ok(format!("No changes could be applied to {} after {} attempts. Please review the edit instructions and try again.", path, max_retries));
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "No changes could be applied in attempt {}. Retrying...",
+                        attempt + 1
+                    )
+                );
+            }
         }
+
+        Ok(format!(
+            "Failed to apply changes to {} after {} attempts.",
+            path, max_retries
+        ))
+    }
+
+    pub async fn apply_edits(
+        &self,
+        file_path: &str,
+        edit_instructions: Vec<Value>,
+        original_content: &str,
+    ) -> Result<(String, bool, String)> {
+        let mut changes_made = false;
+        let mut edited_content = original_content.to_string();
+        let total_edits = edit_instructions.len();
+        let mut failed_edits = Vec::new();
+
+        let term = Term::stdout();
+        let mut task_count = 1;
+
+        for (i, edit) in edit_instructions.iter().enumerate() {
+            let search_content = edit["search"].as_str().unwrap().trim();
+            let replace_content = edit["replace"].as_str().unwrap().trim();
+
+            let pattern = Regex::new(&regex::escape(search_content))?;
+            if let Some(mat) = pattern.find(&edited_content) {
+                let start = mat.start();
+                let end = mat.end();
+                let replace_content_cleaned = Regex::new(r"</?SEARCH>|</?REPLACE>")?
+                    .replace_all(replace_content, "")
+                    .into_owned();
+                edited_content = format!(
+                    "{}{}{}",
+                    &edited_content[..start],
+                    replace_content_cleaned,
+                    &edited_content[end..]
+                );
+                changes_made = true;
+
+                let diff_result = self.generate_diff(search_content, replace_content, file_path)?;
+                term.write_line(&format!(
+                    "Changes in {} ({}/{})",
+                    file_path,
+                    i + 1,
+                    total_edits
+                ))?;
+                term.write_line(&diff_result)?;
+            } else {
+                term.write_line(&format!(
+                    "Edit {}/{} not applied: content not found",
+                    i + 1,
+                    total_edits
+                ))?;
+                failed_edits.push(format!("Edit {}: {}", i + 1, search_content));
+            }
+
+            task_count += 1;
+            info!("Task {} completed", task_count);
+        }
+
+        if !changes_made {
+            term.write_line(
+                "No changes were applied. The file content already matches the desired state.",
+            );
+        } else {
+            fs::write(file_path, &edited_content)?;
+            term.write_line(&format!("Changes have been written to {}", file_path))?;
+        }
+
+        Ok((edited_content, changes_made, failed_edits.join("\n")))
+    }
+
+    fn generate_diff(&self, old: &str, new: &str, file_path: &str) -> Result<String> {
+        let mut diff_output = String::new();
+
+        for diff_result in diff::lines(old, new) {
+            match diff_result {
+                diff::Result::Left(l) => diff_output.push_str(&format!("-{}\n", l)),
+                diff::Result::Both(l, _) => diff_output.push_str(&format!(" {}\n", l)),
+                diff::Result::Right(r) => diff_output.push_str(&format!("+{}\n", r)),
+            }
+        }
+
+        Ok(diff_output)
     }
 
     fn read_file(&self, path: &str) -> Result<String> {
@@ -313,7 +641,8 @@ mod tests {
 
     #[test]
     fn test_create_folder() {
-        let executor = ToolExecutor::new().unwrap();
+        let client = Client::new();
+        let executor = ToolExecutor::new(client).unwrap();
         let temp_dir = tempdir().unwrap();
         let folder_path = temp_dir.path().join("test_folder");
 
@@ -329,7 +658,8 @@ mod tests {
 
     #[test]
     fn test_create_file() {
-        let executor = ToolExecutor::new().unwrap();
+        let client = Client::new();
+        let executor = ToolExecutor::new(client).unwrap();
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_file.txt");
         let content = "Hello, world!";
@@ -347,7 +677,8 @@ mod tests {
 
     #[test]
     fn test_read_file() {
-        let executor = ToolExecutor::new().unwrap();
+        let client = Client::new();
+        let executor = ToolExecutor::new(client).unwrap();
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_read.txt");
         let content = "Test content";
@@ -359,7 +690,8 @@ mod tests {
 
     #[test]
     fn test_list_files() {
-        let executor = ToolExecutor::new().unwrap();
+        let client = Client::new();
+        let executor = ToolExecutor::new(client).unwrap();
         let temp_dir = tempdir().unwrap();
         fs::write(temp_dir.path().join("file1.txt"), "").unwrap();
         fs::write(temp_dir.path().join("file2.txt"), "").unwrap();
