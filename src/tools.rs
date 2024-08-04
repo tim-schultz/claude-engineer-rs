@@ -7,13 +7,13 @@ use diff;
 use lazy_static::lazy_static;
 use log::info;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::sync::Mutex;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -169,17 +169,21 @@ pub static TOOLS: Lazy<Value> = Lazy::new(|| {
 });
 
 pub struct ToolExecutor {
-    version: i8,
     client: Client,
     code_editor_tokens: HashMap<String, u32>,
     code_editor_memory: Vec<String>,
     code_editor_files: HashSet<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EditInstruction {
+    pub search: String,
+    pub replace: String,
+}
+
 impl ToolExecutor {
     pub fn new(client: Client) -> Result<Self> {
         Ok(Self {
-            version: 0,
             client,
             code_editor_tokens: HashMap::new(),
             code_editor_memory: Vec::new(),
@@ -203,7 +207,7 @@ impl ToolExecutor {
                 self.edit_and_apply(
                     tool_input["path"].as_str().ok_or(anyhow!("Missing path"))?,
                     tool_input
-                        .get("new_content")
+                        .get("instructions")
                         .and_then(|c| c.as_str())
                         .ok_or(anyhow!("Missing new_content"))?,
                     tool_input["project_context"]
@@ -398,7 +402,7 @@ impl ToolExecutor {
             .client
             .clone()
             .system(&system_prompt)
-            .messages(&json!({"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}))
+            .messages(&json!([{"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}]))
             .build()?;
 
         let response = request.execute_and_return_json().await?;
@@ -470,7 +474,9 @@ impl ToolExecutor {
                 )
                 .await?;
 
-            let edit_instructions: Vec<Value> = serde_json::from_str(&edit_instructions_json)?;
+            let edit_instructions: Vec<EditInstruction> =
+                serde_json::from_str(&edit_instructions_json)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse edit instructions: {}", e))?;
             println!(
                 "{}",
                 format!(
@@ -484,11 +490,7 @@ impl ToolExecutor {
                 println!("Block {}:", i + 1);
                 println!(
                     "{}",
-                    format!(
-                        "SEARCH:\n{}\n\nREPLACE:\n{}",
-                        block["search"].as_str().unwrap_or(""),
-                        block["replace"].as_str().unwrap_or("")
-                    )
+                    format!("SEARCH:\n{}\n\nREPLACE:\n{}", block.search, block.replace)
                 );
             }
 
@@ -537,7 +539,7 @@ impl ToolExecutor {
     pub async fn apply_edits(
         &self,
         file_path: &str,
-        edit_instructions: Vec<Value>,
+        edit_instructions: Vec<EditInstruction>,
         original_content: &str,
     ) -> Result<(String, bool, String)> {
         let mut changes_made = false;
@@ -549,10 +551,10 @@ impl ToolExecutor {
         let mut task_count = 1;
 
         for (i, edit) in edit_instructions.iter().enumerate() {
-            let search_content = edit["search"].as_str().unwrap().trim();
-            let replace_content = edit["replace"].as_str().unwrap().trim();
+            let search_content = &edit.search;
+            let replace_content = &edit.replace;
 
-            let pattern = Regex::new(&regex::escape(search_content))?;
+            let pattern = Regex::new(&format!("(?s){}", regex::escape(search_content)))?;
             if let Some(mat) = pattern.find(&edited_content) {
                 let start = mat.start();
                 let end = mat.end();
@@ -591,7 +593,7 @@ impl ToolExecutor {
         if !changes_made {
             term.write_line(
                 "No changes were applied. The file content already matches the desired state.",
-            );
+            )?;
         } else {
             fs::write(file_path, &edited_content)?;
             term.write_line(&format!("Changes have been written to {}", file_path))?;
@@ -638,6 +640,11 @@ impl ToolExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // #[test]
+    // fn test_apply_edits() {
+    //     let edit_instruction = '[{"replace":"use log::{info, debug, error, warn};","search":"use log::info;"},{"replace":"pub fn new(client: Client) -> Result<Self> {\n    info!(\"Creating new ToolExecutor instance\");\n    Ok(Self {\n        version: 0,\n        client,\n        code_editor_tokens: HashMap::new(),\n        code_editor_memory: Vec::new(),\n        code_editor_files: HashSet::new(),\n    })\n}","search":"pub fn new(client: Client) -> Result<Self> {\n    Ok(Self {\n        version: 0,\n        client,\n        code_editor_tokens: HashMap::new(),\n        code_editor_memory: Vec::new(),\n        code_editor_files: HashSet::new(),\n    })\n}"},{"replace":"pub async fn execute_tool(&mut self, tool_name: &str, tool_input: &Value) -> Result<String> {\n    info!(\"Executing tool: {}\", tool_name);\n    debug!(\"Tool input: {:?}\", tool_input);\n    match tool_name {\n        \"create_folder\" => {\n            let path = tool_input[\"path\"].as_str().ok_or(anyhow!(\"Missing path\"))?;\n            debug!(\"Creating folder at path: ..."
+    // }
 
     #[test]
     fn test_create_folder() {
