@@ -1,0 +1,5 @@
+improve logging for async fn fetch_commit_changes(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
+        let commit = github_tools::fetch_latest_commits(owner, repo, sha).await?;
+        let changes = github_tools::process_commit_changes(commit)?;
+        Ok(changes)
+    } in src/tools.rs
