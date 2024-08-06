@@ -1,27 +1,31 @@
 mod github_tools;
 mod prompts;
 use async_recursion::async_recursion;
+use conversation_manager::Message;
+use env_logger::Env;
+use log::debug;
 use prompts::{BASE_SYSTEM_PROMPT, CHAIN_OF_THOUGHT_PROMPT};
 
 use serde_json::Value;
+
 mod tools;
 use tools::{ToolExecutor, TOOLS};
 
+mod conversation_manager;
+use conversation_manager::ConversationManager;
+
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::io::Read;
 use std::process::Command;
 
+use dotenv::dotenv;
+
 use anthropic_sdk::{AnthropicResponse, Client, ContentItem};
 use log::{error, info, warn};
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Message {
-    role: String,
-    content: MessageContent,
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -59,8 +63,7 @@ pub struct ToolUseResult {
 pub struct Claude {
     client: Client,
     system_prompt: String,
-    conversation_history: Vec<Message>,
-    current_conversation: Vec<Message>,
+    conversation_manager: ConversationManager,
     tool_executor: ToolExecutor,
 }
 
@@ -70,13 +73,15 @@ pub const MAX_CONTINUATION_ITERATIONS: i8 = 25;
 
 impl Claude {
     pub fn new(model: &str) -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .context("Failed to get ANTHROPIC_API_KEY from environment")?;
+        dotenv().ok();
+
+        let api_key = std::env::var("ANTHROPIC_API_KEY_RS")
+            .context("Failed to get ANTHROPIC_API_KEY_RS from environment")?;
+        // .beta("max-tokens-3-5-sonnet-2024-07-15")
         let client = Client::new()
             .auth(&api_key)
             .model(model)
-            .beta("max-tokens-3-5-sonnet-2024-07-15")
-            .max_tokens(8000)
+            .max_tokens(4000)
             .tools(&TOOLS);
         let system_prompt = format!(
             r#"
@@ -87,11 +92,11 @@ impl Claude {
         let tool_client = client.clone().system(&system_prompt.clone());
         let tool_executor =
             ToolExecutor::new(tool_client).context("Failed to create ToolExecutor")?;
+        let conversation_manager = ConversationManager::new(1000);
         Ok(Self {
             client,
             system_prompt,
-            conversation_history: vec![],
-            current_conversation: vec![],
+            conversation_manager,
             tool_executor,
         })
     }
@@ -129,15 +134,25 @@ impl Claude {
     }
 
     pub async fn ask_claude_simple(&mut self, prompt: &str) -> Result<AnthropicResponse> {
-        self.current_conversation = vec![Message {
+        info!("Calling ask_claude_simple function");
+
+        self.conversation_manager.clear_current();
+
+        self.conversation_manager.add_to_current(Message {
             role: "user".to_string(),
             content: MessageContent::Text(prompt.to_string()),
-        }];
+        });
+        debug!("Added new message to current conversation");
 
-        let mut combined_conversation = self.conversation_history.clone();
-        combined_conversation.extend(self.current_conversation.clone());
+        let combined_conversation = self.conversation_manager.get_combined_conversation();
+        debug!(
+            "Combined conversation message count: {}",
+            combined_conversation.len()
+        );
+
         let messages =
             serde_json::to_value(&combined_conversation).context("Failed to serialize messages")?;
+        debug!("Serialized messages for Anthropic request");
 
         let request = self
             .client
@@ -146,20 +161,27 @@ impl Claude {
             .system(&self.system_prompt)
             .build()
             .context("Failed to build Anthropic request")?;
+        info!("Built Anthropic request");
 
-        let res = request
-            .execute_and_return_json()
-            .await
-            .context("Failed to execute Anthropic request")?;
-        Ok(res)
+        match request.execute_and_return_json().await {
+            Ok(res) => {
+                info!("Successfully executed Anthropic request");
+                Ok(res)
+            }
+            Err(e) => {
+                error!("Failed to execute Anthropic request: {:?}", e);
+                Err(e.into())
+            }
+        }
     }
 
     pub async fn ask_claude_tool(
         &mut self,
         tool_results: Vec<ToolUseResult>,
     ) -> Result<AnthropicResponse> {
+        info!("Tool usages: {:?}", &tool_results);
         for tool_usage in tool_results {
-            self.current_conversation.push(Message {
+            self.conversation_manager.add_to_current(Message {
                 role: "assistant".to_string(),
                 content: MessageContent::ToolUseAssistant(vec![ToolUseAssistant {
                     tool_type: "tool_use".to_string(),
@@ -169,7 +191,7 @@ impl Claude {
                 }]),
             });
 
-            self.current_conversation.push(Message {
+            self.conversation_manager.add_to_current(Message {
                 role: "user".to_string(),
                 content: MessageContent::ToolUseUser(vec![ToolUseUser {
                     tool_type: "tool_result".to_string(),
@@ -179,19 +201,18 @@ impl Claude {
             });
         }
 
-        let mut combined_conversation_after_tool = self.conversation_history.clone();
-        combined_conversation_after_tool.extend(self.current_conversation.clone());
+        let combined_conversation = self.conversation_manager.get_combined_conversation();
         info!(
             "Combined conversation length: {}",
-            combined_conversation_after_tool.len()
+            combined_conversation.len()
         );
-        let messages_after_tool = serde_json::to_value(&combined_conversation_after_tool)
+        let messages = serde_json::to_value(&combined_conversation)
             .context("Failed to serialize messages after tool use")?;
 
         let request = self
             .client
             .clone()
-            .messages(&messages_after_tool)
+            .messages(&messages)
             .system(&self.system_prompt)
             .build()
             .context("Failed to build Anthropic request after tool use")?;
@@ -200,29 +221,15 @@ impl Claude {
             .execute_and_return_json()
             .await
             .context("Failed to execute Anthropic request after tool use")?;
+        info!("Tool result: {:?}", res);
         Ok(res)
     }
 
-    #[async_recursion]
-    pub async fn recursive_ask_claude_tool(
-        &mut self,
-        tool_results: Vec<ToolUseResult>,
-    ) -> Result<()> {
-        let max_iterations = 5;
-        let mut current_iteration = 0;
-        let tool_result = self.ask_claude_tool(tool_results).await?;
-        if tool_result.stop_reason == "tool_use" && current_iteration < max_iterations {
-            current_iteration += 1;
-            let (response_text, tool_usages) =
-                self.process_content_response(tool_result.content).await?;
-
-            self.recursive_ask_claude_tool(tool_usages).await?;
-        } else if current_iteration >= max_iterations {
-            warn!("Reached maximum iterations in recursive_ask_claude_tool");
-        }
-        Ok(())
+    pub fn commit_conversation(&mut self) {
+        self.conversation_manager.commit_current_to_history();
     }
 
+    #[async_recursion]
     pub async fn chat_with_claude(&mut self, prompt: &str) -> Result<String> {
         let response = match self.ask_claude_simple(prompt).await {
             Ok(anthropic_response) => {
@@ -231,9 +238,7 @@ impl Claude {
                     .process_content_response(anthropic_response.content)
                     .await?;
 
-                info!("Tool usages: {:?}", tool_usages);
                 let tool_result = self.ask_claude_tool(tool_usages).await?;
-                info!("Tool result: {:?}", tool_result);
 
                 if tool_result.stop_reason == "tool_use" {
                     let (response_text, tool_usages) =
@@ -252,7 +257,7 @@ impl Claude {
                 {
                     warn!("Rate limited. Waiting for 5 seconds before retrying...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    return self.recursive_initiate_query_with_tools(prompt).await;
+                    return self.chat_with_claude(prompt).await;
                 }
                 error!("Execution failed: {:?}", e);
                 Err(e.context("Failed to execute query with tools"))
@@ -261,65 +266,21 @@ impl Claude {
         Ok(response)
     }
 
-    #[async_recursion]
-    pub async fn recursive_initiate_query_with_tools(&mut self, prompt: &str) -> Result<String> {
-        let response = match self.ask_claude_simple(prompt).await {
-            Ok(anthropic_response) => {
-                info!("Anthropic response: {:?}", anthropic_response);
-                let (response_text, tool_usages) = self
-                    .process_content_response(anthropic_response.content)
-                    .await?;
-
-                info!("Tool usages: {:?}", tool_usages);
-                let tool_result = self.ask_claude_tool(tool_usages).await?;
-
-                if tool_result.stop_reason == "tool_use" {
-                    let (response_text, tool_usages) =
-                        self.process_content_response(tool_result.content).await?;
-                    let tool_result = self.ask_claude_tool(tool_usages).await?;
-                    if tool_result.stop_reason == "tool_use" {
-                        return Ok(response_text);
-                    }
-                }
-
-                Ok(response_text)
-            }
-            Err(e) => {
-                if e.to_string()
-                    .contains("Too many Requests. You have been rate limited.")
-                {
-                    warn!("Rate limited. Waiting for 5 seconds before retrying...");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    return self.recursive_initiate_query_with_tools(prompt).await;
-                }
-                error!("Execution failed: {:?}", e);
-                Err(e.context("Failed to execute query with tools"))
-            }
-        }?;
-
-        // let response = res?;
-        if response.contains(CONTINUATION_EXIT_PHRASE) {
-            Ok(response)
-        } else {
-            info!("Response: {}", response);
-            println!("Do you want to proceed with current response? (y/n)");
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-
-            if input.trim().to_lowercase() == "y" {
-                self.recursive_initiate_query_with_tools(&response).await?;
-            } else {
-                let new_prompt = self.load_text_editor()?;
-                self.recursive_initiate_query_with_tools(&new_prompt)
-                    .await?;
-            }
-            Ok("Exiting...".to_string())
-        }
+    pub fn load_existing_prompt(&mut self, file_path: &str) -> Result<String> {
+        let file = fs::File::open(file_path).context("Failed to open prompt.txt")?;
+        let mut contents = String::new();
+        io::BufReader::new(file)
+            .read_to_string(&mut contents)
+            .context("Failed to read contents of prompt.txt")?;
+        Ok(contents)
     }
 
     pub fn load_text_editor(&mut self) -> Result<String> {
-        let file_path = "text.txt";
-        fs::write(file_path, "").context("Failed to write to text.txt")?;
+        let file_path = "prompt.txt";
+        let existing_content = self
+            .load_existing_prompt(file_path)
+            .context("Failed to load existing prompt")?;
+        fs::write(file_path, existing_content).context("Failed to write to text.txt")?;
 
         let formatted_path = format!("./{}", file_path);
         info!("Attempting to open file: {}", formatted_path);
@@ -351,24 +312,50 @@ impl Claude {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
+
+    info!("Starting the program");
+    print!("Enter the model to use: ");
 
     let mut claude = Claude::new(MODEL).context("Failed to initialize Claude")?;
+    info!("Claude instance initialized with model: {}", MODEL);
 
     let contents = claude
         .load_text_editor()
         .context("Failed to load text editor")?;
+    info!("Text editor loaded successfully");
 
+    let mut iteration = 0;
     loop {
-        let response = claude
-            .chat_with_claude(&contents)
-            .await
-            .context("Failed to initiate query with tools")?;
-        info!("Looped response: {}", &response);
-        if response.contains(CONTINUATION_EXIT_PHRASE) {
-            break;
+        iteration += 1;
+        info!("Starting iteration {}", iteration);
+        info!("Processing contents: {}", &contents);
+
+        match claude.chat_with_claude(&contents).await {
+            Ok(response) => {
+                info!(
+                    "Received response from Claude (iteration {}): {}",
+                    iteration, &response
+                );
+                if response.contains(CONTINUATION_EXIT_PHRASE) {
+                    info!("Exit phrase detected. Exiting the loop.");
+                    break;
+                } else {
+                    info!("Continuing to next iteration");
+                }
+                claude.commit_conversation();
+            }
+            Err(e) => {
+                error!(
+                    "Failed to chat with Claude (iteration {}): {:?}",
+                    iteration, e
+                );
+                claude.commit_conversation();
+                return Err(e.context("Failed to initiate query with tools"));
+            }
         }
     }
 
+    info!("Program completed successfully");
     Ok(())
 }

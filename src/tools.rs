@@ -4,9 +4,9 @@ use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
 use console::Term;
 use diff;
-use lazy_static::lazy_static;
-use log::info;
-use regex::Regex;
+use log::{debug, error, info, trace, warn};
+use regex::escape;
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
@@ -14,12 +14,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+use crate::conversation_manager::ConversationManager;
+use crate::conversation_manager::Message;
 use crate::github_tools;
+use crate::MessageContent;
 
 use once_cell::sync::Lazy;
 
@@ -173,6 +177,7 @@ pub struct ToolExecutor {
     code_editor_tokens: HashMap<String, u32>,
     code_editor_memory: Vec<String>,
     code_editor_files: HashSet<String>,
+    conversation_manager: ConversationManager,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,11 +188,13 @@ pub struct EditInstruction {
 
 impl ToolExecutor {
     pub fn new(client: Client) -> Result<Self> {
+        let conversation_manager = ConversationManager::new(1000);
         Ok(Self {
             client,
             code_editor_tokens: HashMap::new(),
             code_editor_memory: Vec::new(),
             code_editor_files: HashSet::new(),
+            conversation_manager,
         })
     }
 
@@ -405,6 +412,11 @@ impl ToolExecutor {
             .messages(&json!([{"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}]))
             .build()?;
 
+        self.conversation_manager.add_to_current(Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(system_prompt),
+        });
+
         let response = request.execute_and_return_json().await?;
 
         self.code_editor_tokens
@@ -451,7 +463,7 @@ impl ToolExecutor {
         project_context: &str,
     ) -> Result<String> {
         let is_automode = false;
-        let max_retries = 5;
+        let max_retries = 1;
 
         let mut file_contents: HashMap<String, String> = HashMap::new();
         let original_content = match file_contents.get(path) {
@@ -543,52 +555,83 @@ impl ToolExecutor {
         original_content: &str,
     ) -> Result<(String, bool, String)> {
         let mut changes_made = false;
-        let mut edited_content = original_content.to_string();
+        let mut original_content_lines: Vec<String> =
+            original_content.lines().map(String::from).collect();
+        let mut edited_lines: Vec<String> = original_content_lines.clone();
         let total_edits = edit_instructions.len();
         let mut failed_edits = Vec::new();
 
         let term = Term::stdout();
-        let mut task_count = 1;
 
         for (i, edit) in edit_instructions.iter().enumerate() {
-            let search_content = &edit.search;
-            let replace_content = &edit.replace;
+            let search_lines: Vec<String> = edit
+                .search
+                .lines()
+                .map(|l| self.normalize_whitespace(l))
+                .collect();
 
-            let pattern = Regex::new(&format!("(?s){}", regex::escape(search_content)))?;
-            if let Some(mat) = pattern.find(&edited_content) {
-                let start = mat.start();
-                let end = mat.end();
-                let replace_content_cleaned = Regex::new(r"</?SEARCH>|</?REPLACE>")?
-                    .replace_all(replace_content, "")
-                    .into_owned();
-                edited_content = format!(
-                    "{}{}{}",
-                    &edited_content[..start],
-                    replace_content_cleaned,
-                    &edited_content[end..]
-                );
-                changes_made = true;
+            let replace_lines: Vec<String> = edit.replace.lines().map(String::from).collect();
 
-                let diff_result = self.generate_diff(search_content, replace_content, file_path)?;
+            let mut edit_applied = false;
+
+            'outer: for start_index in 0..edited_lines.len() {
+                if edited_lines.len() - start_index < search_lines.len() {
+                    break;
+                }
+
+                let mut match_found = true;
+                for (j, search_line) in search_lines.iter().enumerate() {
+                    let normalized_edited_line =
+                        self.normalize_whitespace(&edited_lines[start_index + j]);
+                    if normalized_edited_line != *search_line {
+                        match_found = false;
+                        break;
+                    }
+                }
+
+                if match_found {
+                    let end_index = start_index + search_lines.len() - 1;
+                    let _ = edited_lines
+                        .splice(start_index..end_index, replace_lines)
+                        .collect::<Vec<String>>();
+
+                    let edited_file = edited_lines.join("\n");
+
+                    self.generate_and_apply_diff(
+                        &original_content_lines.join("\n"),
+                        &edited_file,
+                        file_path,
+                    )?;
+
+                    original_content_lines = fs::read_to_string(file_path)?
+                        .lines()
+                        .map(String::from)
+                        .collect();
+
+                    changes_made = true;
+                    edit_applied = true;
+                    break 'outer;
+                }
+            }
+
+            if edit_applied {
                 term.write_line(&format!(
-                    "Changes in {} ({}/{})",
+                    "Changes applied in {} ({}/{})",
                     file_path,
                     i + 1,
                     total_edits
                 ))?;
-                term.write_line(&diff_result)?;
             } else {
                 term.write_line(&format!(
                     "Edit {}/{} not applied: content not found",
                     i + 1,
                     total_edits
                 ))?;
-                failed_edits.push(format!("Edit {}: {}", i + 1, search_content));
+                failed_edits.push(format!("Edit {}: {}", i + 1, edit.search));
             }
-
-            task_count += 1;
-            info!("Task {} completed", task_count);
         }
+
+        let edited_content = edited_lines.join("\n");
 
         if !changes_made {
             term.write_line(
@@ -602,7 +645,12 @@ impl ToolExecutor {
         Ok((edited_content, changes_made, failed_edits.join("\n")))
     }
 
+    fn normalize_whitespace(&self, s: &str) -> String {
+        s.split_whitespace().collect::<Vec<&str>>().join(" ")
+    }
+
     fn generate_diff(&self, old: &str, new: &str, file_path: &str) -> Result<String> {
+        debug!("Generating diff for file: {}", file_path);
         let mut diff_output = String::new();
 
         for diff_result in diff::lines(old, new) {
@@ -613,6 +661,11 @@ impl ToolExecutor {
             }
         }
 
+        info!(
+            "Generated diff for {} with size {} bytes",
+            file_path,
+            diff_output.len()
+        );
         Ok(diff_output)
     }
 
@@ -621,30 +674,100 @@ impl ToolExecutor {
     }
 
     fn list_files(&self, path: &str) -> Result<String> {
+        debug!("Listing files in directory: {}", path);
+        let entries = fs::read_dir(path).map_err(|e| {
+            error!("Failed to read directory {}: {}", path, e);
+            e
+        })?;
+
+        let files: Result<Vec<_>, io::Error> = entries
+            .map(|entry| {
+                entry.map(|e| {
+                    let file_name = e.file_name().into_string().unwrap();
+                    trace!("Found file: {}", file_name);
+                    file_name
+                })
+            })
+            .collect();
+
+        let file_list = files.map_err(|e| {
+            error!("Error collecting file names: {}", e);
+            e
+        })?;
+
+        let result = file_list.join("\n");
+        info!("Listed {} files in directory {}", file_list.len(), path);
+        Ok(result)
+    }
+
+    async fn fetch_commit_changes(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
+        debug!(
+            "Fetching commit changes for {}/{} with SHA: {}",
+            owner, repo, sha
+        );
+        match github_tools::fetch_latest_commits(owner, repo, sha).await {
+            Ok(commit) => {
+                info!("Successfully fetched commit for {}/{}", owner, repo);
+                match github_tools::process_commit_changes(commit) {
+                    Ok(changes) => {
+                        info!("Successfully processed commit changes");
+                        Ok(changes)
+                    }
+                    Err(e) => {
+                        error!("Failed to process commit changes: {}", e);
+                        Err(e.into())
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch commit for {}/{}: {}", owner, repo, e);
+                Err(e.into())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use super::*;
+    use tempfile::tempdir;
+    use tokio;
+
+    #[tokio::test]
+    async fn test_apply_edits() {
+        let current_file = file!();
+        let current_path = PathBuf::from(env::current_dir().unwrap()).join(current_file);
+        let current_path_str = current_path.to_str().unwrap();
+
+        let client = Client::new();
+        let executor = ToolExecutor::new(client).unwrap();
+        let original_content = fs::read_to_string(current_path_str).unwrap();
+        let edit_result = executor
+            .apply_edits(
+                current_path_str,
+                vec![EditInstruction {
+                    search: r#"fn list_files(&self, path: &str) -> Result<String> {
         dbg!(&path);
         let entries = fs::read_dir(path)?;
         let files: Result<Vec<_>, io::Error> = entries
             .map(|entry| entry.map(|e| e.file_name().into_string().unwrap()))
             .collect();
         Ok(files?.join("\n"))
+    }"#
+                    .to_string(),
+                    replace: r#"REPLACEDDDDD
+        "#
+                    .to_string(),
+                }],
+                &original_content,
+            )
+            .await
+            .unwrap();
+
+        dbg!(&edit_result);
     }
-
-    async fn fetch_commit_changes(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
-        let commit = github_tools::fetch_latest_commits(owner, repo, sha).await?;
-        let changes = github_tools::process_commit_changes(commit)?;
-        Ok(changes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    // #[test]
-    // fn test_apply_edits() {
-    //     let edit_instruction = '[{"replace":"use log::{info, debug, error, warn};","search":"use log::info;"},{"replace":"pub fn new(client: Client) -> Result<Self> {\n    info!(\"Creating new ToolExecutor instance\");\n    Ok(Self {\n        version: 0,\n        client,\n        code_editor_tokens: HashMap::new(),\n        code_editor_memory: Vec::new(),\n        code_editor_files: HashSet::new(),\n    })\n}","search":"pub fn new(client: Client) -> Result<Self> {\n    Ok(Self {\n        version: 0,\n        client,\n        code_editor_tokens: HashMap::new(),\n        code_editor_memory: Vec::new(),\n        code_editor_files: HashSet::new(),\n    })\n}"},{"replace":"pub async fn execute_tool(&mut self, tool_name: &str, tool_input: &Value) -> Result<String> {\n    info!(\"Executing tool: {}\", tool_name);\n    debug!(\"Tool input: {:?}\", tool_input);\n    match tool_name {\n        \"create_folder\" => {\n            let path = tool_input[\"path\"].as_str().ok_or(anyhow!(\"Missing path\"))?;\n            debug!(\"Creating folder at path: ..."
-    // }
 
     #[test]
     fn test_create_folder() {

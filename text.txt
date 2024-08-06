@@ -1,0 +1,1 @@
+within src/main.rs we need to save conversation history once chat_with_claude has finished executing
