@@ -34,14 +34,14 @@ impl ConversationManager {
     pub fn add_to_history(&mut self, message: Message) {
         if self.history.len() >= self.max_history_size {
             let removed = self.history.pop_front();
-            debug!("Removed oldest message from history: {:?}", removed);
+            info!("Removed oldest message from history: {:?}", removed);
         }
-        debug!("Adding message to history: {:?}", message);
+        info!("Adding message to history: {:?}", message);
         self.history.push_back(message);
     }
 
     pub fn add_to_current(&mut self, message: Message) {
-        debug!("Adding message to current conversation: {:?}", message);
+        info!("Adding message to current conversation: {:?}", message);
         self.current.push(message);
     }
 
@@ -54,7 +54,7 @@ impl ConversationManager {
         trace!("Getting combined conversation");
         let mut combined = self.history.clone().into_iter().collect::<Vec<Message>>();
         combined.extend(self.current.clone());
-        debug!("Combined conversation size: {}", combined.len());
+        info!("Combined conversation size: {}", combined.len());
         combined
     }
 
@@ -63,7 +63,7 @@ impl ConversationManager {
         for message in self.current.clone().drain(..) {
             self.add_to_history(message);
         }
-        debug!("Current conversation cleared after commit");
+        info!("Current conversation cleared after commit");
     }
 
     pub fn save_chat(&self) -> std::io::Result<String> {
@@ -71,7 +71,7 @@ impl ConversationManager {
         // Generate filename
         let now = Local::now();
         let filename = format!("Chat_{}.md", now.format("%H%M"));
-        debug!("Generated filename: {}", filename);
+        info!("Generated filename: {}", filename);
 
         // Format conversation history
         let mut formatted_chat = String::from("# Claude-3-Sonnet Engineer Chat Log\n\n");

@@ -405,6 +405,8 @@ impl ToolExecutor {
             "#
         );
 
+        info!("Sending edit instructions: {}", system_prompt);
+
         let request = self
             .client
             .clone()
@@ -431,6 +433,8 @@ impl ToolExecutor {
             ContentItem::Text { text } => text,
             _ => return Err(anyhow!("Invalid response content")),
         };
+
+        info!("Received edit instructions: {}", text);
 
         let edit_instructions = self.parse_search_replace_blocks(&text).await?;
 
@@ -462,7 +466,6 @@ impl ToolExecutor {
         instructions: &str,
         project_context: &str,
     ) -> Result<String> {
-        let is_automode = false;
         let max_retries = 1;
 
         let mut file_contents: HashMap<String, String> = HashMap::new();
@@ -592,7 +595,7 @@ impl ToolExecutor {
                 if match_found {
                     let end_index = start_index + search_lines.len() - 1;
                     let _ = edited_lines
-                        .splice(start_index..end_index, replace_lines)
+                        .splice(start_index..=end_index, replace_lines)
                         .collect::<Vec<String>>();
 
                     let edited_file = edited_lines.join("\n");
@@ -650,7 +653,7 @@ impl ToolExecutor {
     }
 
     fn generate_diff(&self, old: &str, new: &str, file_path: &str) -> Result<String> {
-        debug!("Generating diff for file: {}", file_path);
+        info!("Generating diff for file: {}", file_path);
         let mut diff_output = String::new();
 
         for diff_result in diff::lines(old, new) {
@@ -674,7 +677,7 @@ impl ToolExecutor {
     }
 
     fn list_files(&self, path: &str) -> Result<String> {
-        debug!("Listing files in directory: {}", path);
+        info!("Listing files in directory: {}", path);
         let entries = fs::read_dir(path).map_err(|e| {
             error!("Failed to read directory {}: {}", path, e);
             e
@@ -701,7 +704,7 @@ impl ToolExecutor {
     }
 
     async fn fetch_commit_changes(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
-        debug!(
+        info!(
             "Fetching commit changes for {}/{} with SHA: {}",
             owner, repo, sha
         );

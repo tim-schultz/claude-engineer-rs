@@ -36,3 +36,6 @@ console = "0.15"
 dialoguer = "0.10"
 diff = "0.1.13"
 chrono = "0.4.38"
+orca-core = { path = "../orca/orca-core" } 
+scraper = "0.20.0"
+openai-api-rs = "5.0.4"

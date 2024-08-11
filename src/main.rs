@@ -14,9 +14,10 @@ use tools::{ToolExecutor, TOOLS};
 mod conversation_manager;
 use conversation_manager::ConversationManager;
 
-use anyhow::{anyhow, Context, Result};
+mod language_documentation;
+
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -142,17 +143,17 @@ impl Claude {
             role: "user".to_string(),
             content: MessageContent::Text(prompt.to_string()),
         });
-        debug!("Added new message to current conversation");
+        info!("Added new message to current conversation");
 
         let combined_conversation = self.conversation_manager.get_combined_conversation();
-        debug!(
+        info!(
             "Combined conversation message count: {}",
             combined_conversation.len()
         );
 
         let messages =
             serde_json::to_value(&combined_conversation).context("Failed to serialize messages")?;
-        debug!("Serialized messages for Anthropic request");
+        info!("Serialized messages for Anthropic request");
 
         let request = self
             .client
@@ -267,7 +268,12 @@ impl Claude {
     }
 
     pub fn load_existing_prompt(&mut self, file_path: &str) -> Result<String> {
-        let file = fs::File::open(file_path).context("Failed to open prompt.txt")?;
+        let file = match fs::File::open(file_path).context("Failed to open prompt.txt") {
+            Ok(file) => file,
+            Err(_) => {
+                return Ok(String::new());
+            }
+        };
         let mut contents = String::new();
         io::BufReader::new(file)
             .read_to_string(&mut contents)
@@ -312,26 +318,60 @@ impl Claude {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     info!("Starting the program");
-    print!("Enter the model to use: ");
 
     let mut claude = Claude::new(MODEL).context("Failed to initialize Claude")?;
     info!("Claude instance initialized with model: {}", MODEL);
 
-    let contents = claude
+    let mut prompt = claude
         .load_text_editor()
         .context("Failed to load text editor")?;
     info!("Text editor loaded successfully");
 
     let mut iteration = 0;
     loop {
-        iteration += 1;
-        info!("Starting iteration {}", iteration);
-        info!("Processing contents: {}", &contents);
+        if iteration > 0 {
+            info!(
+                r#"
+                Starting a new iteration. How would you like to proceed?
+                c: Continue from the last response
+                e: Exit the program
+                n: Input a new prompt
+            "#
+            );
 
-        match claude.chat_with_claude(&contents).await {
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            let command = input.trim().to_lowercase();
+
+            match command.as_str() {
+                "c" => {
+                    info!("Continuing from the last response");
+                }
+                "e" => {
+                    info!("Exiting the program");
+                    break;
+                }
+                "n" => {
+                    info!("Inputting a new prompt");
+                    prompt = claude
+                        .load_text_editor()
+                        .context("Failed to load text editor")?;
+                }
+                _ => {
+                    info!("Invalid command. Continuing from the last response");
+                    panic!("Invalid command");
+                }
+            }
+        }
+
+        info!("Starting iteration {}", iteration);
+        info!("Processing contents: {}", &prompt);
+
+        match claude.chat_with_claude(&prompt).await {
             Ok(response) => {
                 info!(
                     "Received response from Claude (iteration {}): {}",
@@ -343,17 +383,17 @@ async fn main() -> Result<()> {
                 } else {
                     info!("Continuing to next iteration");
                 }
-                claude.commit_conversation();
             }
             Err(e) => {
                 error!(
                     "Failed to chat with Claude (iteration {}): {:?}",
                     iteration, e
                 );
-                claude.commit_conversation();
                 return Err(e.context("Failed to initiate query with tools"));
             }
         }
+
+        iteration += 1;
     }
 
     info!("Program completed successfully");
