@@ -83,7 +83,8 @@ impl Claude {
             .auth(&api_key)
             .model(model)
             .max_tokens(4000)
-            .tools(&TOOLS);
+            .tools(&TOOLS)
+            .beta("prompt-caching-2024-07-31");
         let system_prompt = format!(
             r#"
             {}
@@ -396,6 +397,7 @@ async fn main() -> Result<()> {
         iteration += 1;
     }
 
+    fs::remove_file("prompt.txt")?;
     info!("Program completed successfully");
     Ok(())
 }
