@@ -14,7 +14,7 @@ use tools::{ToolExecutor, TOOLS};
 mod conversation_manager;
 use conversation_manager::ConversationManager;
 
-mod language_documentation;
+// mod language_documentation;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
